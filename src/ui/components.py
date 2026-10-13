@@ -11,6 +11,8 @@ from PIL import Image
 
 from src.core.exceptions import ValidationError
 from src.core.models import (
+    CaptionSource,
+    CaptionTrackInfo,
     JobStatus,
     LocalMediaInfo,
     MediaMetadata,
@@ -214,11 +216,14 @@ class MetadataPreviewCard(ctk.CTkFrame):
         self._current_local_info = None
         self._retry_btn.pack_forget()
 
-        if thumbnail_bytes:
-            self._set_thumbnail_from_bytes(thumbnail_bytes)
-        else:
-            badge_txt = "PLAYLIST" if metadata.is_playlist else "VIDEO"
-            self._clear_thumbnail(badge_txt)
+        try:
+            if thumbnail_bytes:
+                self._set_thumbnail_from_bytes(thumbnail_bytes)
+            else:
+                badge_txt = "PLAYLIST" if metadata.is_playlist else "VIDEO"
+                self._clear_thumbnail(badge_txt)
+        except Exception:
+            self._clear_thumbnail("VIDEO")
 
         self._title_label.configure(text=metadata.title)
 
@@ -306,20 +311,34 @@ class MetadataPreviewCard(ctk.CTkFrame):
         self._retry_btn.pack_forget()
 
     def _clear_thumbnail(self, placeholder_text: str) -> None:
+        try:
+            if hasattr(self._thumb_label, "_label"):
+                self._thumb_label._label.configure(image="")
+            self._thumb_label.configure(image=None, text=placeholder_text)
+        except Exception:
+            try:
+                self._thumb_label.configure(text=placeholder_text)
+            except Exception:
+                pass
         self._ctk_thumb_image = None
-        self._thumb_label.configure(image=None, text=placeholder_text)
 
     def _set_thumbnail_from_bytes(self, raw_bytes: bytes) -> None:
         try:
             with Image.open(io.BytesIO(raw_bytes)) as pil_img:
                 rgb_img = pil_img.convert("RGB")
                 rgb_img.thumbnail((144, 82))
-                self._ctk_thumb_image = ctk.CTkImage(
+                new_image = ctk.CTkImage(
                     light_image=rgb_img,
                     dark_image=rgb_img,
                     size=(144, 82),
                 )
-                self._thumb_label.configure(image=self._ctk_thumb_image, text="")
+                if hasattr(self._thumb_label, "_label"):
+                    try:
+                        self._thumb_label._label.configure(image="")
+                    except Exception:
+                        pass
+                self._thumb_label.configure(image=new_image, text="")
+                self._ctk_thumb_image = new_image
         except Exception:
             self._clear_thumbnail("VIDEO")
 
@@ -802,3 +821,338 @@ class TrimTimelineWidget(ctk.CTkFrame):
                     accurate_trim=self.is_accurate_trim(),
                 )
             )
+
+
+class CaptionTrackSelectorWidget(ctk.CTkFrame):
+    """Searchable, scrollable, multi-select caption track selector with category tabs.
+
+    Displays ONLY tracks actually reported as available for the current video by yt-dlp.
+    Supports filtering by All Available, Manual, and Auto-generated categories,
+    real-time search text filtering, and multi-selection with select all / clear actions.
+    """
+
+    def __init__(
+        self,
+        master: ctk.CTkBaseClass,
+        on_selection_changed: Callable[[list[str]], None] | None = None,
+        height: int = 150,
+    ) -> None:
+        super().__init__(master, corner_radius=8, border_width=1, border_color=("gray80", "gray28"))
+        self._on_selection_changed = on_selection_changed
+        self._all_tracks: list[CaptionTrackInfo] = []
+        self._selected_codes: set[str] = set()
+        self._current_category: str = "all"  # "all", "manual", "auto"
+        self._search_text: str = ""
+        self._checkbox_vars: dict[str, tk.BooleanVar] = {}
+
+        self.grid_columnconfigure(0, weight=1)
+
+        # Top row: Search input + Category segmented button + Select all / Clear
+        top_bar = ctk.CTkFrame(self, fg_color="transparent")
+        top_bar.grid(row=0, column=0, sticky="ew", padx=10, pady=(8, 4))
+        top_bar.grid_columnconfigure(0, weight=1)
+
+        self._search_entry = ctk.CTkEntry(
+            top_bar,
+            placeholder_text="Search language or code (e.g. English, es)...",
+            height=28,
+            font=ctk.CTkFont(size=11),
+        )
+        self._search_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self._search_entry.bind("<KeyRelease>", self._on_search_key_released)
+
+        self._category_segmented = ctk.CTkSegmentedButton(
+            top_bar,
+            values=["All (0)", "Manual (0)", "Auto (0)"],
+            font=ctk.CTkFont(size=11),
+            height=28,
+            command=self._on_category_changed,
+        )
+        self._category_segmented.set("All (0)")
+        self._category_segmented.grid(row=0, column=1, padx=(0, 8))
+
+        btn_box = ctk.CTkFrame(top_bar, fg_color="transparent")
+        btn_box.grid(row=0, column=2, sticky="e")
+
+        self._select_all_btn = ctk.CTkButton(
+            btn_box,
+            text="Select All",
+            width=70,
+            height=28,
+            font=ctk.CTkFont(size=11),
+            command=self.select_all_visible,
+        )
+        self._select_all_btn.pack(side="left", padx=(0, 4))
+
+        self._clear_sel_btn = ctk.CTkButton(
+            btn_box,
+            text="Clear",
+            width=54,
+            height=28,
+            font=ctk.CTkFont(size=11),
+            fg_color=("gray75", "gray30"),
+            text_color=("gray10", "gray90"),
+            command=self.deselect_all,
+        )
+        self._clear_sel_btn.pack(side="left")
+
+        # Summary strip
+        self._summary_label = ctk.CTkLabel(
+            self,
+            text="Captions: 0 available • None selected",
+            font=ctk.CTkFont(size=11),
+            text_color=("gray35", "gray70"),
+            anchor="w",
+        )
+        self._summary_label.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 4))
+
+        # Scrollable list frame
+        self._scroll_frame = ctk.CTkScrollableFrame(self, height=height, fg_color="transparent")
+        self._scroll_frame.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        self._scroll_frame.grid_columnconfigure(0, weight=1)
+
+        self._empty_label = ctk.CTkLabel(
+            self._scroll_frame,
+            text="No caption tracks available. Fetch video details above.",
+            font=ctk.CTkFont(size=11),
+            text_color=("gray45", "gray60"),
+            justify="center",
+        )
+        self._empty_label.grid(row=0, column=0, pady=20)
+
+    # ------------------------------------------------------------------
+    # Data & Rendering
+    # ------------------------------------------------------------------
+
+    def set_tracks(
+        self,
+        tracks: list[CaptionTrackInfo],
+        default_selected_codes: list[str] | None = None,
+    ) -> None:
+        """Populate the selector with available caption tracks from MediaMetadata."""
+        self._all_tracks = list(tracks)
+        manual_cnt = sum(1 for t in tracks if t.source == CaptionSource.MANUAL)
+        auto_cnt = sum(1 for t in tracks if t.source == CaptionSource.AUTOMATIC)
+        total_cnt = len(tracks)
+
+        # Update category tab labels
+        cat_labels = [f"All ({total_cnt})", f"Manual ({manual_cnt})", f"Auto ({auto_cnt})"]
+        self._category_segmented.configure(values=cat_labels)
+        current_choice = {
+            "all": cat_labels[0],
+            "manual": cat_labels[1],
+            "auto": cat_labels[2],
+        }.get(self._current_category, cat_labels[0])
+        self._category_segmented.set(current_choice)
+
+        # Set default selections
+        if default_selected_codes is not None:
+            self._selected_codes = {c for c in default_selected_codes if c}
+        elif not self._selected_codes:
+            # Default to English if available, or first manual track, or first track
+            en_track = next((t for t in tracks if t.language_code == "en"), None)
+            if en_track:
+                self._selected_codes = {"en"}
+            elif tracks:
+                self._selected_codes = {tracks[0].language_code}
+            else:
+                self._selected_codes.clear()
+        else:
+            # Keep only codes that exist in the new tracks
+            avail = {t.language_code for t in tracks}
+            self._selected_codes = {c for c in self._selected_codes if c in avail}
+
+        self._render_tracks()
+        self._notify_selection_changed()
+
+    def clear(self) -> None:
+        """Clear all tracks and reset selection."""
+        self._all_tracks.clear()
+        self._selected_codes.clear()
+        self._category_segmented.configure(values=["All (0)", "Manual (0)", "Auto (0)"])
+        self._category_segmented.set("All (0)")
+        self._render_tracks()
+        self._notify_selection_changed()
+
+    def get_selected_codes(self) -> list[str]:
+        """Return the sorted list of selected language codes."""
+        # Preserve original track ordering where possible
+        ordered: list[str] = []
+        for t in self._all_tracks:
+            if t.language_code in self._selected_codes and t.language_code not in ordered:
+                ordered.append(t.language_code)
+        # Any other selected codes
+        for c in sorted(self._selected_codes):
+            if c not in ordered:
+                ordered.append(c)
+        return ordered
+
+    def set_selected_codes(self, codes: list[str]) -> None:
+        """Set which language codes are currently selected."""
+        self._selected_codes = {c.strip() for c in codes if c.strip()}
+        for code, var in self._checkbox_vars.items():
+            var.set(code in self._selected_codes)
+        self._update_summary()
+        self._notify_selection_changed()
+
+    def select_all_visible(self) -> None:
+        """Select all caption tracks currently matching category and search filter."""
+        visible = self._get_filtered_tracks()
+        for t in visible:
+            self._selected_codes.add(t.language_code)
+            var = self._checkbox_vars.get(t.language_code)
+            if var is not None:
+                var.set(True)
+        self._update_summary()
+        self._notify_selection_changed()
+
+    def deselect_all(self) -> None:
+        """Deselect all caption tracks."""
+        self._selected_codes.clear()
+        for var in self._checkbox_vars.values():
+            var.set(False)
+        self._update_summary()
+        self._notify_selection_changed()
+
+    # ------------------------------------------------------------------
+    # Filtering & Event Handlers
+    # ------------------------------------------------------------------
+
+    def _get_filtered_tracks(self) -> list[CaptionTrackInfo]:
+        filtered: list[CaptionTrackInfo] = []
+        query = self._search_text.strip().lower()
+
+        for t in self._all_tracks:
+            # Category filter
+            if self._current_category == "manual" and t.source != CaptionSource.MANUAL:
+                continue
+            if self._current_category == "auto" and t.source != CaptionSource.AUTOMATIC:
+                continue
+
+            # Search text filter
+            if query:
+                name_match = query in t.language_name.lower()
+                code_match = query in t.language_code.lower()
+                if not (name_match or code_match):
+                    continue
+
+            filtered.append(t)
+        return filtered
+
+    def _on_category_changed(self, choice: str) -> None:
+        if "Manual" in choice:
+            self._current_category = "manual"
+        elif "Auto" in choice:
+            self._current_category = "auto"
+        else:
+            self._current_category = "all"
+        self._render_tracks()
+
+    def _on_search_key_released(self, _event: object) -> None:
+        text = self._search_entry.get()
+        if text != self._search_text:
+            self._search_text = text
+            self._render_tracks()
+
+    def _on_checkbox_toggled(self, code: str, is_checked: bool) -> None:
+        if is_checked:
+            self._selected_codes.add(code)
+        else:
+            self._selected_codes.discard(code)
+        self._update_summary()
+        self._notify_selection_changed()
+
+    def _render_tracks(self) -> None:
+        # Clear existing children in scroll frame
+        for child in self._scroll_frame.winfo_children():
+            child.destroy()
+        self._checkbox_vars.clear()
+
+        visible_tracks = self._get_filtered_tracks()
+
+        if not self._all_tracks:
+            self._empty_label = ctk.CTkLabel(
+                self._scroll_frame,
+                text="No caption tracks available. Fetch video details above.",
+                font=ctk.CTkFont(size=11),
+                text_color=("gray45", "gray60"),
+                justify="center",
+            )
+            self._empty_label.grid(row=0, column=0, pady=20)
+            self._update_summary()
+            return
+
+        if not visible_tracks:
+            empty_msg = (
+                f"No matching tracks for '{self._search_text}'."
+                if self._search_text
+                else f"No {self._current_category} tracks found."
+            )
+            self._empty_label = ctk.CTkLabel(
+                self._scroll_frame,
+                text=empty_msg,
+                font=ctk.CTkFont(size=11),
+                text_color=("gray45", "gray60"),
+                justify="center",
+            )
+            self._empty_label.grid(row=0, column=0, pady=20)
+            self._update_summary()
+            return
+
+        for idx, track in enumerate(visible_tracks):
+            row_frame = ctk.CTkFrame(self._scroll_frame, fg_color="transparent")
+            row_frame.grid(row=idx, column=0, sticky="ew", padx=4, pady=2)
+            row_frame.grid_columnconfigure(0, weight=1)
+
+            is_selected = track.language_code in self._selected_codes
+            cb_var = tk.BooleanVar(value=is_selected)
+            self._checkbox_vars[track.language_code] = cb_var
+
+            display_name = f"{track.language_name} ({track.language_code})"
+            cb = ctk.CTkCheckBox(
+                row_frame,
+                text=display_name,
+                variable=cb_var,
+                font=ctk.CTkFont(size=11),
+                checkbox_width=18,
+                checkbox_height=18,
+                command=lambda c=track.language_code, v=cb_var: self._on_checkbox_toggled(c, v.get()),
+            )
+            cb.grid(row=0, column=0, sticky="w")
+
+            # Source badge: [Manual] or [Auto]
+            is_manual = track.source == CaptionSource.MANUAL
+            badge_text = "Manual" if is_manual else "Auto"
+            badge_fg = ("#0284c7", "#0369a1") if is_manual else ("#64748b", "#475569")
+
+            badge = ctk.CTkLabel(
+                row_frame,
+                text=badge_text,
+                font=ctk.CTkFont(size=10, weight="bold"),
+                text_color="white",
+                corner_radius=4,
+                width=52,
+                height=18,
+                fg_color=badge_fg,
+            )
+            badge.grid(row=0, column=1, sticky="e", padx=(8, 4))
+
+        self._update_summary()
+
+    def _update_summary(self) -> None:
+        total = len(self._all_tracks)
+        sel_count = len(self._selected_codes)
+        sel_codes_str = ", ".join(self.get_selected_codes()) if self._selected_codes else "None"
+        manual_cnt = sum(1 for t in self._all_tracks if t.source == CaptionSource.MANUAL)
+        auto_cnt = sum(1 for t in self._all_tracks if t.source == CaptionSource.AUTOMATIC)
+
+        if total == 0:
+            self._summary_label.configure(text="Captions: 0 available • None selected")
+        else:
+            self._summary_label.configure(
+                text=f"Captions: {manual_cnt} manual, {auto_cnt} auto • {sel_count} selected: {sel_codes_str}"
+            )
+
+    def _notify_selection_changed(self) -> None:
+        if self._on_selection_changed is not None:
+            self._on_selection_changed(self.get_selected_codes())

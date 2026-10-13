@@ -7,7 +7,7 @@ from typing import Callable
 import customtkinter as ctk  # type: ignore[import-untyped]
 
 from src.core.exceptions import AppError
-from src.core.models import DownloadJob, JobStatus
+from src.core.models import DownloadJob, DownloadMode, JobStatus
 from src.services.queue_service import QueueService
 from src.ui.components import (
     STATUS_BADGE_COLORS,
@@ -16,7 +16,7 @@ from src.ui.components import (
     format_eta,
     format_speed,
 )
-from src.ui.dialogs import show_error_dialog
+from src.ui.dialogs import ask_confirmation_dialog, show_error_dialog
 from src.utils.platform_utils import open_media_file, reveal_in_file_manager
 
 
@@ -344,7 +344,7 @@ class QueueItemCard(ctk.CTkFrame):
 
 
 class QueueView(ctk.CTkFrame):
-    """Scrollable multi-item download queue view with batch actions and status summary."""
+    """Scrollable multi-item download queue view with status filter tabs and bulk actions."""
 
     def __init__(
         self,
@@ -354,9 +354,10 @@ class QueueView(ctk.CTkFrame):
         super().__init__(master, corner_radius=8)
         self._queue_service = queue_service
         self._cards: dict[str, QueueItemCard] = {}
+        self._current_filter: str = "all"  # "all", "active", "paused", "queued", "completed", "failed", "cancelled"
 
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(1, weight=1)
+        self.grid_rowconfigure(2, weight=1)
 
         # Toolbar header
         header = ctk.CTkFrame(self, fg_color="transparent")
@@ -377,26 +378,82 @@ class QueueView(ctk.CTkFrame):
         self._start_all_btn = ctk.CTkButton(
             actions,
             text="Start Queued Jobs",
-            width=136,
+            width=126,
             height=28,
             command=self._handle_start_queue,
         )
-        self._start_all_btn.pack(side="left", padx=(0, 8))
+        self._start_all_btn.pack(side="left", padx=(0, 6))
+
+        self._pause_all_btn = ctk.CTkButton(
+            actions,
+            text="Pause All",
+            width=92,
+            height=28,
+            fg_color=("#d97706", "#b45309"),
+            hover_color=("#b45309", "#92400e"),
+            command=self._handle_pause_all,
+        )
+        self._pause_all_btn.pack(side="left", padx=(0, 6))
+
+        self._stop_all_btn = ctk.CTkButton(
+            actions,
+            text="Stop All",
+            width=84,
+            height=28,
+            fg_color=("#dc2626", "#991b1b"),
+            hover_color=("#b91c1c", "#7f1d1d"),
+            command=self._handle_stop_all,
+        )
+        self._stop_all_btn.pack(side="left", padx=(0, 6))
 
         self._clear_done_btn = ctk.CTkButton(
             actions,
             text="Clear Completed",
-            width=126,
+            width=118,
             height=28,
             fg_color=("gray75", "gray30"),
             text_color=("gray10", "gray90"),
             command=self._handle_clear_completed,
         )
-        self._clear_done_btn.pack(side="left")
+        self._clear_done_btn.pack(side="left", padx=(0, 6))
+
+        self._clear_failed_btn = ctk.CTkButton(
+            actions,
+            text="Clear Failed",
+            width=98,
+            height=28,
+            fg_color=("gray75", "gray30"),
+            text_color=("gray10", "gray90"),
+            command=self._handle_clear_failed,
+        )
+        self._clear_failed_btn.pack(side="left")
+
+        # Status filter pills / tabs
+        filter_bar = ctk.CTkFrame(self, fg_color="transparent")
+        filter_bar.grid(row=1, column=0, sticky="ew", padx=12, pady=(2, 6))
+        filter_bar.grid_columnconfigure(0, weight=1)
+
+        self._filter_segmented = ctk.CTkSegmentedButton(
+            filter_bar,
+            values=[
+                "All (0)",
+                "Active (0)",
+                "Paused (0)",
+                "Queued (0)",
+                "Completed (0)",
+                "Failed (0)",
+                "Cancelled (0)",
+            ],
+            font=ctk.CTkFont(size=11),
+            height=28,
+            command=self._on_filter_changed,
+        )
+        self._filter_segmented.set("All (0)")
+        self._filter_segmented.grid(row=0, column=0, sticky="ew")
 
         # Scrollable container
         self._scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
-        self._scroll.grid(row=1, column=0, sticky="nsew", padx=8, pady=(2, 8))
+        self._scroll.grid(row=2, column=0, sticky="nsew", padx=8, pady=(2, 8))
         self._scroll.grid_columnconfigure(0, weight=1)
 
         self._empty_label = ctk.CTkLabel(
@@ -411,39 +468,92 @@ class QueueView(ctk.CTkFrame):
         )
         self._empty_label.grid(row=0, column=0, pady=36)
 
-    def refresh_all(self) -> None:
-        """Synchronize all QueueItemCard widgets with the current QueueService state."""
-        jobs = self._queue_service.list_jobs()
-        current_ids = {job.job_id for job in jobs}
+    def _on_filter_changed(self, choice: str) -> None:
+        if "Active" in choice:
+            self._current_filter = "active"
+        elif "Paused" in choice:
+            self._current_filter = "paused"
+        elif "Queued" in choice:
+            self._current_filter = "queued"
+        elif "Completed" in choice:
+            self._current_filter = "completed"
+        elif "Failed" in choice:
+            self._current_filter = "failed"
+        elif "Cancelled" in choice:
+            self._current_filter = "cancelled"
+        else:
+            self._current_filter = "all"
+        self.refresh_all()
 
+    def refresh_all(self) -> None:
+        """Synchronize all QueueItemCard widgets with current QueueService state and active filter."""
+        all_jobs = self._queue_service.list_jobs()
+
+        queued_cnt = sum(1 for j in all_jobs if j.status == JobStatus.QUEUED)
+        active_cnt = sum(1 for j in all_jobs if j.status.is_active or j.status == JobStatus.PROCESSING)
+        paused_cnt = sum(1 for j in all_jobs if j.status == JobStatus.PAUSED)
+        done_cnt = sum(1 for j in all_jobs if j.status == JobStatus.COMPLETED)
+        failed_cnt = sum(1 for j in all_jobs if j.status == JobStatus.FAILED)
+        cancelled_cnt = sum(1 for j in all_jobs if j.status == JobStatus.CANCELLED)
+
+        # Update filter tabs
+        filter_values = [
+            f"All ({len(all_jobs)})",
+            f"Active ({active_cnt})",
+            f"Paused ({paused_cnt})",
+            f"Queued ({queued_cnt})",
+            f"Completed ({done_cnt})",
+            f"Failed ({failed_cnt})",
+            f"Cancelled ({cancelled_cnt})",
+        ]
+        self._filter_segmented.configure(values=filter_values)
+        active_label = {
+            "all": filter_values[0],
+            "active": filter_values[1],
+            "paused": filter_values[2],
+            "queued": filter_values[3],
+            "completed": filter_values[4],
+            "failed": filter_values[5],
+            "cancelled": filter_values[6],
+        }.get(self._current_filter, filter_values[0])
+        self._filter_segmented.set(active_label)
+
+        # Filter jobs according to active filter
+        if self._current_filter == "active":
+            visible_jobs = [j for j in all_jobs if j.status.is_active or j.status == JobStatus.PROCESSING]
+        elif self._current_filter == "paused":
+            visible_jobs = [j for j in all_jobs if j.status == JobStatus.PAUSED]
+        elif self._current_filter == "queued":
+            visible_jobs = [j for j in all_jobs if j.status == JobStatus.QUEUED]
+        elif self._current_filter == "completed":
+            visible_jobs = [j for j in all_jobs if j.status == JobStatus.COMPLETED]
+        elif self._current_filter == "failed":
+            visible_jobs = [j for j in all_jobs if j.status == JobStatus.FAILED]
+        elif self._current_filter == "cancelled":
+            visible_jobs = [j for j in all_jobs if j.status == JobStatus.CANCELLED]
+        else:
+            visible_jobs = all_jobs
+
+        visible_ids = {j.job_id for j in visible_jobs}
+
+        # Remove cards not visible
         for stale_id in list(self._cards.keys()):
-            if stale_id not in current_ids:
+            if stale_id not in visible_ids:
                 card = self._cards.pop(stale_id)
                 card.destroy()
 
-        if not jobs:
+        if not visible_jobs:
+            msg = (
+                "Your download queue is currently empty.\nPaste one or more YouTube URLs above."
+                if not all_jobs
+                else f"No {self._current_filter} jobs found in the queue."
+            )
+            self._empty_label.configure(text=msg)
             self._empty_label.grid(row=0, column=0, pady=36)
         else:
             self._empty_label.grid_forget()
 
-        queued_cnt = 0
-        active_cnt = 0
-        paused_cnt = 0
-        done_cnt = 0
-        failed_cnt = 0
-
-        for idx, job in enumerate(jobs):
-            if job.status == JobStatus.QUEUED:
-                queued_cnt += 1
-            elif job.status.is_active:
-                active_cnt += 1
-            elif job.status == JobStatus.PAUSED:
-                paused_cnt += 1
-            elif job.status == JobStatus.COMPLETED:
-                done_cnt += 1
-            elif job.status == JobStatus.FAILED:
-                failed_cnt += 1
-
+        for idx, job in enumerate(visible_jobs):
             card = self._cards.get(job.job_id)
             if card is None:
                 card = QueueItemCard(
@@ -459,12 +569,11 @@ class QueueView(ctk.CTkFrame):
                 self._cards[job.job_id] = card
             else:
                 card.update_from_job(job)
-
             card.grid(row=idx, column=0, sticky="ew", padx=4, pady=4)
 
         self._summary_lbl.configure(
             text=(
-                f"Download Queue ({len(jobs)})   •   "
+                f"Download Queue ({len(all_jobs)})   •   "
                 f"Active: {active_cnt}   •   Paused: {paused_cnt}   •   Queued: {queued_cnt}   •   "
                 f"Completed: {done_cnt}   •   Failed: {failed_cnt}"
             )
@@ -482,8 +591,26 @@ class QueueView(ctk.CTkFrame):
         self._queue_service.start_queue()
         self.refresh_all()
 
+    def _handle_pause_all(self) -> None:
+        self._queue_service.pause_all()
+        self.refresh_all()
+
+    def _handle_stop_all(self) -> None:
+        confirmed = ask_confirmation_dialog(
+            self,
+            "Stop All Downloads",
+            "Are you sure you want to cancel all active and queued downloads in the queue?",
+        )
+        if confirmed:
+            self._queue_service.cancel_all()
+            self.refresh_all()
+
     def _handle_clear_completed(self) -> None:
         self._queue_service.clear_completed_jobs()
+        self.refresh_all()
+
+    def _handle_clear_failed(self) -> None:
+        self._queue_service.clear_failed_jobs()
         self.refresh_all()
 
     def _handle_start_job(self, job_id: str) -> None:
@@ -521,3 +648,450 @@ class QueueView(ctk.CTkFrame):
             self.refresh_all()
         except AppError as exc:
             show_error_dialog(self, "Cannot Remove Job", exc.user_message, exc.remedy)
+
+
+class CompactJobCard(ctk.CTkFrame):
+    """Compact ~68px widget representing a single DownloadJob in the main window Current Jobs panel."""
+
+    def __init__(
+        self,
+        master: ctk.CTkBaseClass,
+        job: DownloadJob,
+        on_start: Callable[[str], None],
+        on_pause: Callable[[str], None],
+        on_resume: Callable[[str], None],
+        on_cancel: Callable[[str], None],
+        on_retry: Callable[[str], None],
+        on_remove: Callable[[str], None],
+    ) -> None:
+        super().__init__(master, corner_radius=6, border_width=1, border_color=("gray80", "gray28"))
+        self._job_id = job.job_id
+        self._on_start = on_start
+        self._on_pause = on_pause
+        self._on_resume = on_resume
+        self._on_cancel = on_cancel
+        self._on_retry = on_retry
+        self._on_remove = on_remove
+        self._last_status: JobStatus | None = None
+
+        self.grid_columnconfigure(0, weight=1)
+
+        # Top row: Mode tag + Title (truncated) + Status Badge
+        top_row = ctk.CTkFrame(self, fg_color="transparent")
+        top_row.grid(row=0, column=0, sticky="ew", padx=10, pady=(6, 2))
+        top_row.grid_columnconfigure(1, weight=1)
+
+        self._tag_lbl = ctk.CTkLabel(
+            top_row,
+            text="[Video]",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=("#0284c7", "#38bdf8"),
+        )
+        self._tag_lbl.grid(row=0, column=0, padx=(0, 6), sticky="w")
+
+        self._title_lbl = ctk.CTkLabel(
+            top_row,
+            text=job.display_title,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            anchor="w",
+        )
+        self._title_lbl.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+
+        self._status_badge = ctk.CTkLabel(
+            top_row,
+            text="Queued",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color="white",
+            corner_radius=4,
+            width=88,
+            height=20,
+        )
+        self._status_badge.grid(row=0, column=2, sticky="e")
+
+        # Middle row: Progress bar
+        self._progress_bar = ctk.CTkProgressBar(self, height=6)
+        self._progress_bar.grid(row=1, column=0, sticky="ew", padx=10, pady=(1, 2))
+        self._progress_bar.set(0.0)
+
+        # Bottom row: Metrics + Actions
+        bot_row = ctk.CTkFrame(self, fg_color="transparent")
+        bot_row.grid(row=2, column=0, sticky="ew", padx=10, pady=(1, 6))
+        bot_row.grid_columnconfigure(0, weight=1)
+
+        self._metrics_lbl = ctk.CTkLabel(
+            bot_row,
+            text="",
+            font=ctk.CTkFont(size=10),
+            text_color=("gray30", "gray75"),
+            anchor="w",
+        )
+        self._metrics_lbl.grid(row=0, column=0, sticky="ew")
+
+        self._btn_frame = ctk.CTkFrame(bot_row, fg_color="transparent")
+        self._btn_frame.grid(row=0, column=1, sticky="e")
+
+        self.update_from_job(job)
+
+    def update_from_job(self, job: DownloadJob) -> None:
+        """Refresh labels, progress, and contextual quick actions."""
+        # Mode Tag
+        if job.local_source_path or job.trim_enabled:
+            tag = "[Trim]"
+        elif job.mode == DownloadMode.CAPTIONS:
+            tag = "[Captions]"
+        elif job.mode == DownloadMode.AUDIO:
+            tag = "[Audio]"
+        else:
+            tag = "[Video]"
+        self._tag_lbl.configure(text=tag)
+
+        # Safe truncation for title
+        raw_title = job.display_title
+        if len(raw_title) > 65:
+            display_title = raw_title[:62] + "..."
+        else:
+            display_title = raw_title
+        self._title_lbl.configure(text=display_title)
+
+        badge_text = STATUS_LABELS.get(job.status, job.status.value.title())
+        badge_color = STATUS_BADGE_COLORS.get(job.status, ("#64748b", "#475569"))
+        self._status_badge.configure(text=badge_text, fg_color=badge_color)
+
+        pct = max(0.0, min(100.0, float(job.progress_percent or 0.0)))
+        self._progress_bar.set(pct / 100.0)
+
+        # Format metrics line: omit speed & ETA when they do not apply
+        if job.status == JobStatus.FETCHING_METADATA:
+            self._metrics_lbl.configure(
+                text=job.stage_detail or "Retrieving media metadata...",
+                text_color=("gray25", "gray80"),
+            )
+        elif job.status == JobStatus.DOWNLOADING:
+            dl_str = format_bytes(job.downloaded_bytes)
+            tot_str = format_bytes(job.total_bytes) if job.total_bytes else "Unknown size"
+            spd_str = format_speed(job.speed_bps)
+            eta_str = format_eta(job.eta_seconds)
+            stage_pfx = f"{job.stage_detail}  •  " if job.stage_detail else ""
+            self._metrics_lbl.configure(
+                text=f"{stage_pfx}{pct:.1f}% ({dl_str} / {tot_str})  •  Speed: {spd_str}  •  ETA: {eta_str}",
+                text_color=("gray25", "gray80"),
+            )
+        elif job.status == JobStatus.PAUSED:
+            dl_str = format_bytes(job.downloaded_bytes)
+            self._metrics_lbl.configure(
+                text=f"Paused at {pct:.1f}% ({dl_str}) — click Resume to continue.",
+                text_color=("#b45309", "#fbbf24"),
+            )
+        elif job.status == JobStatus.PROCESSING:
+            self._metrics_lbl.configure(
+                text=job.stage_detail or "100% — Merging streams / processing media...",
+                text_color=("#6d28d9", "#c4b5fd"),
+            )
+        elif job.status == JobStatus.COMPLETED:
+            size_str = format_bytes(job.file_size_bytes)
+            out_name = job.output_path.name if job.output_path else "Saved"
+            self._metrics_lbl.configure(
+                text=f"Completed ({size_str})  •  {out_name}",
+                text_color=("#15803d", "#4ade80"),
+            )
+        elif job.status == JobStatus.FAILED:
+            err_line = (job.error_message or "Download failed.").splitlines()[0]
+            self._metrics_lbl.configure(
+                text=f"Error: {err_line}",
+                text_color=("#b91c1c", "#f87171"),
+            )
+        elif job.status == JobStatus.CANCELLED:
+            self._metrics_lbl.configure(
+                text="Cancelled by user.",
+                text_color=("gray40", "gray65"),
+            )
+        else:
+            self._metrics_lbl.configure(
+                text=job.stage_detail or "Waiting in queue...",
+                text_color=("gray40", "gray65"),
+            )
+
+        if self._last_status != job.status:
+            self._last_status = job.status
+            self._rebuild_action_buttons(job)
+
+    def _rebuild_action_buttons(self, job: DownloadJob) -> None:
+        for child in self._btn_frame.winfo_children():
+            child.destroy()
+
+        if job.status == JobStatus.QUEUED:
+            ctk.CTkButton(
+                self._btn_frame,
+                text="Start",
+                width=52,
+                height=22,
+                font=ctk.CTkFont(size=10),
+                command=lambda: self._on_start(job.job_id),
+            ).pack(side="left", padx=2)
+            ctk.CTkButton(
+                self._btn_frame,
+                text="Cancel",
+                width=56,
+                height=22,
+                font=ctk.CTkFont(size=10),
+                fg_color=("#dc2626", "#991b1b"),
+                hover_color=("#b91c1c", "#7f1d1d"),
+                command=lambda: self._on_cancel(job.job_id),
+            ).pack(side="left", padx=2)
+
+        elif job.status.is_active:
+            ctk.CTkButton(
+                self._btn_frame,
+                text="Pause",
+                width=54,
+                height=22,
+                font=ctk.CTkFont(size=10),
+                fg_color=("#d97706", "#b45309"),
+                hover_color=("#b45309", "#92400e"),
+                command=lambda: self._on_pause(job.job_id),
+            ).pack(side="left", padx=2)
+            ctk.CTkButton(
+                self._btn_frame,
+                text="Cancel",
+                width=56,
+                height=22,
+                font=ctk.CTkFont(size=10),
+                fg_color=("#dc2626", "#991b1b"),
+                hover_color=("#b91c1c", "#7f1d1d"),
+                command=lambda: self._on_cancel(job.job_id),
+            ).pack(side="left", padx=2)
+
+        elif job.status == JobStatus.PAUSED:
+            ctk.CTkButton(
+                self._btn_frame,
+                text="Resume",
+                width=58,
+                height=22,
+                font=ctk.CTkFont(size=10),
+                fg_color=("#16a34a", "#15803d"),
+                hover_color=("#15803d", "#166534"),
+                command=lambda: self._on_resume(job.job_id),
+            ).pack(side="left", padx=2)
+            ctk.CTkButton(
+                self._btn_frame,
+                text="Cancel",
+                width=56,
+                height=22,
+                font=ctk.CTkFont(size=10),
+                fg_color=("#dc2626", "#991b1b"),
+                hover_color=("#b91c1c", "#7f1d1d"),
+                command=lambda: self._on_cancel(job.job_id),
+            ).pack(side="left", padx=2)
+
+        elif job.status in {JobStatus.FAILED, JobStatus.CANCELLED}:
+            ctk.CTkButton(
+                self._btn_frame,
+                text="Retry",
+                width=56,
+                height=22,
+                font=ctk.CTkFont(size=10),
+                command=lambda: self._on_retry(job.job_id),
+            ).pack(side="left", padx=2)
+            ctk.CTkButton(
+                self._btn_frame,
+                text="Remove",
+                width=56,
+                height=22,
+                font=ctk.CTkFont(size=10),
+                fg_color=("gray75", "gray30"),
+                text_color=("gray10", "gray90"),
+                command=lambda: self._on_remove(job.job_id),
+            ).pack(side="left", padx=2)
+
+        elif job.status == JobStatus.COMPLETED:
+            if job.output_path and job.output_path.is_file():
+                ctk.CTkButton(
+                    self._btn_frame,
+                    text="Open File",
+                    width=68,
+                    height=22,
+                    font=ctk.CTkFont(size=10),
+                    fg_color=("#16a34a", "#15803d"),
+                    hover_color=("#15803d", "#166534"),
+                    command=lambda p=job.output_path: self._safe_open_file(p),
+                ).pack(side="left", padx=2)
+            ctk.CTkButton(
+                self._btn_frame,
+                text="Open Folder",
+                width=78,
+                height=22,
+                font=ctk.CTkFont(size=10),
+                command=lambda p=(job.output_path or job.destination_dir): self._safe_open_folder(p),
+            ).pack(side="left", padx=2)
+            ctk.CTkButton(
+                self._btn_frame,
+                text="Remove",
+                width=56,
+                height=22,
+                font=ctk.CTkFont(size=10),
+                fg_color=("gray75", "gray30"),
+                text_color=("gray10", "gray90"),
+                command=lambda: self._on_remove(job.job_id),
+            ).pack(side="left", padx=2)
+
+    def _safe_open_file(self, path: object) -> None:
+        try:
+            open_media_file(str(path))
+        except AppError as exc:
+            show_error_dialog(self, "Cannot Open Media File", exc.user_message, exc.remedy)
+
+    def _safe_open_folder(self, path: object) -> None:
+        try:
+            reveal_in_file_manager(str(path))
+        except AppError as exc:
+            show_error_dialog(self, "Cannot Open Folder", exc.user_message, exc.remedy)
+
+
+class CurrentJobsPanel(ctk.CTkFrame):
+    """Compact bottom section on the main window displaying at most two download jobs."""
+
+    def __init__(
+        self,
+        master: ctk.CTkBaseClass,
+        queue_service: QueueService,
+        on_open_full_queue: Callable[[], None] | None = None,
+    ) -> None:
+        super().__init__(master, corner_radius=8)
+        self._queue_service = queue_service
+        self._on_open_full_queue = on_open_full_queue
+        self._cards: dict[str, CompactJobCard] = {}
+
+        self.grid_columnconfigure(0, weight=1)
+
+        # Header bar
+        header = ctk.CTkFrame(self, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", padx=12, pady=(8, 4))
+        header.grid_columnconfigure(0, weight=1)
+
+        self._summary_lbl = ctk.CTkLabel(
+            header,
+            text="Current Jobs (0)   •   Active: 0   •   Queued: 0",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            anchor="w",
+        )
+        self._summary_lbl.grid(row=0, column=0, sticky="w")
+
+        self._open_queue_btn = ctk.CTkButton(
+            header,
+            text="Open Full Queue (0)",
+            width=156,
+            height=28,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=self._handle_open_full_queue,
+        )
+        self._open_queue_btn.grid(row=0, column=1, sticky="e")
+
+        # Container for compact cards
+        self._cards_container = ctk.CTkFrame(self, fg_color="transparent")
+        self._cards_container.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
+        self._cards_container.grid_columnconfigure(0, weight=1)
+
+        self._empty_label = ctk.CTkLabel(
+            self._cards_container,
+            text="No active or queued jobs. Paste a URL above to start downloading.",
+            font=ctk.CTkFont(size=11),
+            text_color=("gray45", "gray60"),
+            justify="center",
+        )
+        self._empty_label.grid(row=0, column=0, pady=16)
+
+    def _handle_open_full_queue(self) -> None:
+        if self._on_open_full_queue is not None:
+            self._on_open_full_queue()
+
+    def refresh_all(self) -> None:
+        all_jobs = self._queue_service.list_jobs()
+        current_jobs = self._queue_service.get_current_jobs(max_count=2)
+        current_ids = {j.job_id for j in current_jobs}
+
+        # Remove cards no longer in the top 2
+        for stale_id in list(self._cards.keys()):
+            if stale_id not in current_ids:
+                card = self._cards.pop(stale_id)
+                card.destroy()
+
+        if not all_jobs:
+            self._empty_label.grid(row=0, column=0, pady=16)
+        else:
+            self._empty_label.grid_forget()
+
+        for idx, job in enumerate(current_jobs):
+            card = self._cards.get(job.job_id)
+            if card is None:
+                card = CompactJobCard(
+                    self._cards_container,
+                    job=job,
+                    on_start=self._handle_start_job,
+                    on_pause=self._handle_pause_job,
+                    on_resume=self._handle_resume_job,
+                    on_cancel=self._handle_cancel_job,
+                    on_retry=self._handle_retry_job,
+                    on_remove=self._handle_remove_job,
+                )
+                self._cards[job.job_id] = card
+            else:
+                card.update_from_job(job)
+            card.grid(row=idx, column=0, sticky="ew", padx=2, pady=3)
+
+        # Update summary counts
+        active_cnt = sum(1 for j in all_jobs if j.status.is_active or j.status == JobStatus.PROCESSING)
+        queued_cnt = sum(1 for j in all_jobs if j.status == JobStatus.QUEUED)
+        total_cnt = len(all_jobs)
+
+        self._summary_lbl.configure(
+            text=f"Current Jobs ({len(current_jobs)})   •   Active: {active_cnt}   •   Queued: {queued_cnt}   •   Total: {total_cnt}"
+        )
+        self._open_queue_btn.configure(text=f"Open Full Queue ({total_cnt})")
+
+    def refresh_job(self, job: DownloadJob) -> None:
+        card = self._cards.get(job.job_id)
+        if card is not None:
+            card.update_from_job(job)
+        else:
+            self.refresh_all()
+
+    # Per-job actions
+    def _handle_start_job(self, job_id: str) -> None:
+        self._queue_service.start_single_job(job_id)
+        self.refresh_all()
+
+    def _handle_pause_job(self, job_id: str) -> None:
+        try:
+            self._queue_service.pause_job(job_id)
+            self.refresh_all()
+        except AppError as exc:
+            show_error_dialog(self, "Cannot Pause Job", exc.user_message, exc.remedy)
+
+    def _handle_resume_job(self, job_id: str) -> None:
+        try:
+            self._queue_service.resume_job(job_id, start_immediately=True)
+            self.refresh_all()
+        except AppError as exc:
+            show_error_dialog(self, "Cannot Resume Job", exc.user_message, exc.remedy)
+
+    def _handle_cancel_job(self, job_id: str) -> None:
+        self._queue_service.cancel_job(job_id)
+        self.refresh_all()
+
+    def _handle_retry_job(self, job_id: str) -> None:
+        try:
+            self._queue_service.retry_job(job_id, start_immediately=True)
+            self.refresh_all()
+        except AppError as exc:
+            show_error_dialog(self, "Cannot Retry Job", exc.user_message, exc.remedy)
+
+    def _handle_remove_job(self, job_id: str) -> None:
+        try:
+            self._queue_service.remove_job(job_id)
+            self.refresh_all()
+        except AppError as exc:
+            show_error_dialog(self, "Cannot Remove Job", exc.user_message, exc.remedy)
+
+    def _handle_clear_completed(self) -> None:
+        self._queue_service.clear_completed_jobs()
+        self.refresh_all()

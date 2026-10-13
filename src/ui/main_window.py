@@ -43,16 +43,22 @@ from src.services.ffmpeg_service import FFmpegService
 from src.services.media_info_service import MediaInfoService
 from src.services.queue_service import QueueService
 from src.services.settings_service import SettingsService
-from src.ui.components import MetadataPreviewCard, TrimTimelineWidget
+from src.ui.components import (
+    CaptionTrackSelectorWidget,
+    MetadataPreviewCard,
+    TrimTimelineWidget,
+)
 from src.ui.dialogs import (
+    CaptionSelectionDialog,
     DiagnosticsDialog,
     PlaylistSelectionDialog,
     ask_confirmation_dialog,
     show_error_dialog,
     show_warning_dialog,
 )
+from src.ui.full_queue_window import FullQueueWindow
 from src.ui.history_view import HistoryView
-from src.ui.queue_view import QueueView
+from src.ui.queue_view import CurrentJobsPanel, QueueView
 from src.ui.settings_view import SettingsView
 from src.utils.logging_config import get_logger
 from src.utils.platform_utils import open_directory
@@ -87,18 +93,21 @@ class MainWindow(ctk.CTk):
         self._log_file_path = log_file_path
 
         self._metadata_cancel_event: threading.Event | None = None
+        self._metadata_request_id: int = 0
         self._current_metadata: MediaMetadata | None = None
         self._current_local_media: LocalMediaInfo | None = None
         self._selected_playlist_mode: PlaylistMode = PlaylistMode.SINGLE
         self._selected_playlist_indices: list[int] = []
         self._caption_label_to_code: dict[str, str] = {}
+        self._selected_caption_codes: list[str] = ["en"]
+        self._full_queue_window: FullQueueWindow | None = None
 
         # Apply saved theme
         self._apply_theme(self._settings_service.settings.theme_mode)
 
         self.title("YouTube Downloader Studio")
-        self.geometry("1180x860")
-        self.minsize(1040, 740)
+        self.geometry("1160x720")
+        self.minsize(1020, 640)
 
         if icon_path and icon_path.exists():
             try:
@@ -224,8 +233,13 @@ class MainWindow(ctk.CTk):
         self._build_metadata_section(self._downloader_view)
         self._build_options_section(self._downloader_view)
 
-        self._queue_view = QueueView(self._downloader_view, queue_service=self._queue_service)
-        self._queue_view.grid(row=3, column=0, sticky="nsew", pady=(4, 0))
+        self._current_jobs_panel = CurrentJobsPanel(
+            self._downloader_view,
+            queue_service=self._queue_service,
+            on_open_full_queue=self.open_full_queue_window,
+        )
+        self._current_jobs_panel.grid(row=3, column=0, sticky="ew", pady=(4, 0))
+        self._queue_view = self._current_jobs_panel
 
         # View 2: History
         self._history_view = HistoryView(
@@ -476,18 +490,14 @@ class MainWindow(ctk.CTk):
         )
         self._captions_row.grid(row=1, column=0, sticky="ew", padx=12, pady=(2, 4))
 
-        cap_inner = ctk.CTkFrame(self._captions_row, fg_color="transparent")
-        cap_inner.pack(fill="x", padx=10, pady=6)
+        # Sub-row 1: Video-mode subtitle checkboxes (hidden in Captions Only mode)
+        self._video_sub_opts_frame = ctk.CTkFrame(self._captions_row, fg_color="transparent")
 
         ctk.CTkLabel(
-            cap_inner,
-            text="Captions / Subtitles:",
+            self._video_sub_opts_frame,
+            text="Subtitles:",
             font=ctk.CTkFont(size=12, weight="bold"),
         ).pack(side="left", padx=(0, 8))
-
-        # Video-mode subtitle checkboxes (hidden in Captions Only mode)
-        self._video_sub_opts_frame = ctk.CTkFrame(cap_inner, fg_color="transparent")
-        self._video_sub_opts_frame.pack(side="left", padx=(0, 8))
 
         self._download_subs_var = tk.BooleanVar(value=False)
         self._download_subs_cb = ctk.CTkCheckBox(
@@ -526,52 +536,39 @@ class MainWindow(ctk.CTk):
         )
         self._keep_sub_files_cb.pack(side="left")
 
-        # Shared caption track / language / format controls
-        ctk.CTkLabel(cap_inner, text="Track:", font=ctk.CTkFont(size=11)).pack(
-            side="left", padx=(4, 4)
+        # Sub-row 2: Compact Caption Controls (visible in both Video and Captions Only modes)
+        self._compact_captions_frame = ctk.CTkFrame(self._captions_row, fg_color="transparent")
+
+        self._captions_title_lbl = ctk.CTkLabel(
+            self._compact_captions_frame,
+            text="Captions & Subtitles:",
+            font=ctk.CTkFont(size=12, weight="bold"),
         )
-        self._caption_track_menu = ctk.CTkOptionMenu(
-            cap_inner,
-            values=["English (en)"],
-            width=175,
-            height=26,
+        self._captions_title_lbl.pack(side="left", padx=(0, 8))
+
+        self._captions_summary_lbl = ctk.CTkLabel(
+            self._compact_captions_frame,
+            text="Available: 0 · Selected: 1 (en)",
             font=ctk.CTkFont(size=11),
-            command=self._on_caption_track_selected,
+            text_color=("gray35", "gray70"),
         )
-        self._caption_track_menu.set("English (en)")
-        self._caption_track_menu.pack(side="left", padx=(0, 8))
+        self._captions_summary_lbl.pack(side="left", padx=(0, 10))
 
-        ctk.CTkLabel(cap_inner, text="Langs:", font=ctk.CTkFont(size=11)).pack(
-            side="left", padx=(0, 4)
-        )
-        self._subtitle_langs_entry = ctk.CTkEntry(
-            cap_inner,
-            width=90,
+        self._choose_captions_btn = ctk.CTkButton(
+            self._compact_captions_frame,
+            text="Choose Captions...",
+            width=130,
             height=26,
-            font=ctk.CTkFont(family="Consolas", size=11),
-            placeholder_text="en, es",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=self._open_caption_selection_dialog,
         )
-        self._subtitle_langs_entry.insert(0, "en")
-        self._subtitle_langs_entry.pack(side="left", padx=(0, 8))
+        self._choose_captions_btn.pack(side="left", padx=(0, 10))
 
-        self._include_auto_captions_var = tk.BooleanVar(value=True)
-        self._include_auto_captions_cb = ctk.CTkCheckBox(
-            cap_inner,
-            text="Auto-Captions",
-            variable=self._include_auto_captions_var,
-            width=105,
-            checkbox_width=18,
-            checkbox_height=18,
-            font=ctk.CTkFont(size=11),
-            command=self._on_auto_captions_filter_changed,
-        )
-        self._include_auto_captions_cb.pack(side="left", padx=(0, 8))
-
-        ctk.CTkLabel(cap_inner, text="Export:", font=ctk.CTkFont(size=11)).pack(
+        ctk.CTkLabel(self._compact_captions_frame, text="Format:", font=ctk.CTkFont(size=11)).pack(
             side="left", padx=(0, 4)
         )
         self._subtitle_format_menu = ctk.CTkOptionMenu(
-            cap_inner,
+            self._compact_captions_frame,
             values=[f.value for f in SubtitleFormat],
             width=76,
             height=26,
@@ -582,15 +579,46 @@ class MainWindow(ctk.CTk):
 
         self._txt_timestamps_var = tk.BooleanVar(value=False)
         self._txt_timestamps_cb = ctk.CTkCheckBox(
-            cap_inner,
-            text="TXT Timestamps",
+            self._compact_captions_frame,
+            text="Include timestamps in TXT",
             variable=self._txt_timestamps_var,
-            width=115,
+            width=165,
             checkbox_width=18,
             checkbox_height=18,
             font=ctk.CTkFont(size=11),
         )
-        self._txt_timestamps_cb.pack(side="left")
+        self._txt_timestamps_cb.pack(side="left", padx=(0, 8))
+
+        self._include_auto_captions_var = tk.BooleanVar(value=True)
+        self._include_auto_captions_cb = ctk.CTkCheckBox(
+            self._compact_captions_frame,
+            text="Auto-generated captions",
+            variable=self._include_auto_captions_var,
+            width=155,
+            checkbox_width=18,
+            checkbox_height=18,
+            font=ctk.CTkFont(size=11),
+            command=self._on_auto_captions_filter_changed,
+        )
+        self._include_auto_captions_cb.pack(side="left")
+
+        # Compatibility frame holding off-screen widgets for test and service compatibility.
+        # These are never packed or gridded into the visible UI.
+        self._compat_frame = ctk.CTkFrame(self)
+        self._caption_track_menu = ctk.CTkOptionMenu(
+            self._compat_frame,
+            values=["English (en)"],
+            command=self._on_caption_track_selected,
+        )
+        self._caption_track_menu.set("English (en)")
+
+        self._subtitle_langs_entry = ctk.CTkEntry(self._compat_frame)
+        self._subtitle_langs_entry.insert(0, "en")
+
+        self._caption_selector = CaptionTrackSelectorWidget(
+            self._compat_frame,
+            on_selection_changed=self._on_caption_selector_changed,
+        )
 
         # Row 2: Synchronized Interactive Trim Timeline (shown in Video & Audio Only modes)
         self._trim_timeline = TrimTimelineWidget(opts_card)
@@ -830,6 +858,8 @@ class MainWindow(ctk.CTk):
         elif value == "Captions Only":
             self._captions_mode_badge.pack(side="left", padx=(0, 12))
             self._video_sub_opts_frame.pack_forget()
+            self._captions_title_lbl.configure(text="Captions & Subtitles:")
+            self._compact_captions_frame.pack(fill="x", padx=10, pady=6)
             self._captions_row.grid(row=1, column=0, sticky="ew", padx=12, pady=(2, 4))
             self._trim_timeline.grid_forget()
             self._download_now_btn.configure(text="▶ Download Captions")
@@ -840,7 +870,9 @@ class MainWindow(ctk.CTk):
                 self._captions_row.grid_forget()
                 self._download_now_btn.configure(text="▶ Trim Video Now")
             else:
-                self._video_sub_opts_frame.pack(side="left", padx=(0, 8), before=self._caption_track_menu.master.winfo_children()[2] if len(self._caption_track_menu.master.winfo_children()) > 2 else None)
+                self._video_sub_opts_frame.pack(fill="x", padx=10, pady=(4, 2))
+                self._captions_title_lbl.configure(text="Captions:")
+                self._compact_captions_frame.pack(fill="x", padx=10, pady=(2, 4))
                 self._captions_row.grid(row=1, column=0, sticky="ew", padx=12, pady=(2, 4))
                 self._download_now_btn.configure(text="▶ Download Now")
             self._trim_timeline.grid(row=2, column=0, sticky="ew", padx=12, pady=(2, 4))
@@ -849,12 +881,119 @@ class MainWindow(ctk.CTk):
         if self._embed_subs_var.get():
             self._download_subs_var.set(True)
 
+    def open_full_queue_window(self) -> None:
+        """Open or focus the separate Full Queue pop-up window."""
+        if self._full_queue_window is not None and self._full_queue_window.winfo_exists():
+            try:
+                self._full_queue_window.deiconify()
+                self._full_queue_window.lift()
+                self._full_queue_window.focus()
+                self._full_queue_window.refresh_all()
+            except Exception:
+                pass
+            return
+
+        self._full_queue_window = FullQueueWindow(
+            self,
+            queue_service=self._queue_service,
+            on_closed=self._on_full_queue_closed,
+        )
+
+    def _on_full_queue_closed(self) -> None:
+        """Callback invoked when FullQueueWindow is closed."""
+        self._full_queue_window = None
+
+    def _open_caption_selection_dialog(self) -> None:
+        """Open modal CaptionSelectionDialog for choosing caption tracks."""
+        tracks = self._current_metadata.caption_tracks if self._current_metadata else []
+        if not tracks:
+            show_warning_dialog(
+                self,
+                "No Captions Available",
+                "No caption tracks were discovered for the current URL. Fetch a valid YouTube URL first.",
+            )
+            return
+
+        dialog = CaptionSelectionDialog(
+            self,
+            tracks=tracks,
+            initial_selected_codes=self._selected_caption_codes,
+            on_confirm=self._on_captions_dialog_confirmed,
+        )
+        dialog.lift()
+        dialog.focus()
+
+    def _on_captions_dialog_confirmed(self, chosen_codes: list[str]) -> None:
+        """Receive confirmed caption track selection from CaptionSelectionDialog."""
+        self._selected_caption_codes = list(chosen_codes)
+        self._subtitle_langs_entry.delete(0, "end")
+        self._subtitle_langs_entry.insert(0, ", ".join(chosen_codes))
+        self._caption_selector.set_selected_codes(chosen_codes)
+        if chosen_codes:
+            first = chosen_codes[0]
+            matching_opt = next((lbl for lbl, c in self._caption_label_to_code.items() if c == first), None)
+            if matching_opt:
+                self._caption_track_menu.set(matching_opt)
+        self._refresh_captions_summary()
+        self._set_status_message(f"Selected {len(chosen_codes)} caption track(s): {', '.join(chosen_codes) if chosen_codes else 'None'}")
+
+    def _refresh_captions_summary(self) -> None:
+        """Update compact caption summary label with available counts and selected tracks."""
+        if self._current_metadata and self._current_metadata.caption_tracks:
+            include_auto = bool(self._include_auto_captions_var.get())
+            tracks = [
+                t
+                for t in self._current_metadata.caption_tracks
+                if t.source == CaptionSource.MANUAL or include_auto
+            ]
+            manual_cnt = sum(1 for t in tracks if t.source == CaptionSource.MANUAL)
+            auto_cnt = sum(1 for t in tracks if t.source == CaptionSource.AUTOMATIC)
+            total_cnt = len(tracks)
+
+            if manual_cnt > 0 and auto_cnt > 0:
+                avail_part = f"Available: {manual_cnt} manual, {auto_cnt} automatic"
+            elif auto_cnt > 0:
+                avail_part = f"Available: {auto_cnt} automatic"
+            elif manual_cnt > 0:
+                avail_part = f"Available: {manual_cnt} manual"
+            else:
+                avail_part = f"Available: {total_cnt}"
+        else:
+            avail_part = "Available: 0"
+
+        sel_cnt = len(self._selected_caption_codes)
+        if sel_cnt > 0:
+            codes_preview = ", ".join(self._selected_caption_codes[:3])
+            if sel_cnt > 3:
+                codes_preview += "..."
+            sel_part = f"Selected: {sel_cnt} ({codes_preview})"
+        else:
+            sel_part = "Selected: 0"
+
+        self._captions_summary_lbl.configure(text=f"{avail_part} · {sel_part}")
+
+    def _on_caption_selector_changed(self, selected_codes: list[str]) -> None:
+        """Handle track selection change from CaptionTrackSelectorWidget."""
+        self._selected_caption_codes = list(selected_codes)
+        self._subtitle_langs_entry.delete(0, "end")
+        if selected_codes:
+            self._subtitle_langs_entry.insert(0, ", ".join(selected_codes))
+            first = selected_codes[0]
+            matching_opt = next((lbl for lbl, c in self._caption_label_to_code.items() if c == first), None)
+            if matching_opt:
+                self._caption_track_menu.set(matching_opt)
+        self._refresh_captions_summary()
+
     def _on_caption_track_selected(self, label: str) -> None:
         code = self._caption_label_to_code.get(label)
         if not code:
             return
         self._subtitle_langs_entry.delete(0, "end")
         self._subtitle_langs_entry.insert(0, code)
+        codes = [c.strip() for c in code.split(",") if c.strip()]
+        self._selected_caption_codes = list(codes)
+        self._caption_selector.set_selected_codes(codes)
+        self._refresh_captions_summary()
 
     def _on_auto_captions_filter_changed(self) -> None:
         if self._current_metadata is not None:
@@ -872,6 +1011,10 @@ class MainWindow(ctk.CTk):
             self._caption_label_to_code["No matching tracks"] = ""
             self._caption_track_menu.configure(values=["No matching tracks"])
             self._caption_track_menu.set("No matching tracks")
+            self._caption_selector.clear()
+            self._selected_caption_codes = []
+            self._subtitle_langs_entry.delete(0, "end")
+            self._refresh_captions_summary()
             return
 
         values: list[str] = []
@@ -896,6 +1039,12 @@ class MainWindow(ctk.CTk):
         if chosen_code:
             self._subtitle_langs_entry.delete(0, "end")
             self._subtitle_langs_entry.insert(0, chosen_code)
+
+        # Synchronize searchable multi-select widget
+        pref_codes = [c.strip() for c in chosen_code.split(",") if c.strip()] if chosen_code else ["en"]
+        self._selected_caption_codes = list(pref_codes)
+        self._caption_selector.set_tracks(tracks, default_selected_codes=pref_codes)
+        self._refresh_captions_summary()
 
     def _on_playlist_menu_changed(self, choice: str) -> None:
         mapping = {
@@ -937,11 +1086,20 @@ class MainWindow(ctk.CTk):
     def _clear_url_input(self) -> None:
         if self._metadata_cancel_event is not None:
             self._metadata_cancel_event.set()
+        self._metadata_request_id += 1
         self._url_textbox.delete("1.0", "end")
         self._current_metadata = None
         self._selected_playlist_indices.clear()
+        self._caption_label_to_code.clear()
+        self._caption_track_menu.configure(values=["No active media"])
+        self._caption_track_menu.set("No active media")
+        self._caption_selector.clear()
+        self._selected_caption_codes = []
+        self._subtitle_langs_entry.delete(0, "end")
+        self._refresh_captions_summary()
         self._preview_card.clear()
         self._trim_timeline.set_total_duration(0.0)
+        self._fetch_info_btn.configure(state="normal", text="Fetch Info / Preview")
         self._set_status_message("Cleared URL input.")
 
     def _browse_local_media_file(self) -> None:
@@ -997,6 +1155,7 @@ class MainWindow(ctk.CTk):
                 f"Line {first_err.line_number}: {first_err.reason}",
                 "Paste a valid https:// YouTube video or playlist link.",
             )
+            self._fetch_info_btn.configure(state="normal", text="Fetch Info / Preview")
             return
 
         if not parsed.valid_urls:
@@ -1005,14 +1164,29 @@ class MainWindow(ctk.CTk):
                 "URL Required",
                 "Please enter at least one YouTube URL before fetching metadata.",
             )
+            self._fetch_info_btn.configure(state="normal", text="Fetch Info / Preview")
             return
 
         target_url = parsed.valid_urls[0]
         if self._metadata_cancel_event is not None:
             self._metadata_cancel_event.set()
 
+        self._metadata_request_id += 1
+        request_id = self._metadata_request_id
+
         cancel_event = threading.Event()
         self._metadata_cancel_event = cancel_event
+
+        # Invalidate previous video metadata and caption options while loading
+        self._current_metadata = None
+        self._selected_playlist_indices.clear()
+        self._caption_label_to_code.clear()
+        self._caption_track_menu.configure(values=["Fetching tracks..."])
+        self._caption_track_menu.set("Fetching tracks...")
+        self._caption_selector.clear()
+        self._selected_caption_codes = []
+        self._subtitle_langs_entry.delete(0, "end")
+        self._refresh_captions_summary()
 
         self._preview_card.show_loading(target_url)
         self._fetch_info_btn.configure(state="disabled", text="Fetching...")
@@ -1020,13 +1194,13 @@ class MainWindow(ctk.CTk):
 
         worker = threading.Thread(
             target=self._metadata_worker,
-            args=(target_url, cancel_event),
-            name="MetadataFetchWorker",
+            args=(target_url, cancel_event, request_id),
+            name=f"MetadataFetchWorker-{request_id}",
             daemon=True,
         )
         worker.start()
 
-    def _metadata_worker(self, url: str, cancel_event: threading.Event) -> None:
+    def _metadata_worker(self, url: str, cancel_event: threading.Event, request_id: int) -> None:
         try:
             allow_pl = is_likely_playlist_url(url)
             meta = self._media_info_service.fetch_metadata(
@@ -1043,6 +1217,7 @@ class MainWindow(ctk.CTk):
                     EventType.METADATA_FETCHED,
                     metadata=meta,
                     thumbnail_bytes=thumb_bytes,
+                    request_id=request_id,
                 )
         except DownloadCancelledError:
             pass
@@ -1052,6 +1227,7 @@ class MainWindow(ctk.CTk):
                     EventType.METADATA_FAILED,
                     message=exc.user_message,
                     remedy=exc.remedy,
+                    request_id=request_id,
                 )
         except Exception as exc:
             if not cancel_event.is_set():
@@ -1059,6 +1235,7 @@ class MainWindow(ctk.CTk):
                     EventType.METADATA_FAILED,
                     message=f"Could not inspect URL: {exc}",
                     remedy="Verify your internet connection and the YouTube URL.",
+                    request_id=request_id,
                 )
 
     def _open_playlist_selector_dialog(self) -> None:
@@ -1255,10 +1432,13 @@ class MainWindow(ctk.CTk):
 
         subtitle_languages: list[str] = ["en"]
         if mode == DownloadMode.CAPTIONS or download_subtitles or embed_subtitles:
+            raw_langs = (
+                ", ".join(self._selected_caption_codes)
+                if self._selected_caption_codes
+                else self._subtitle_langs_entry.get().strip() or "en"
+            )
             try:
-                subtitle_languages = validate_subtitle_languages(
-                    self._subtitle_langs_entry.get()
-                )
+                subtitle_languages = validate_subtitle_languages(raw_langs)
             except AppError as exc:
                 show_error_dialog(
                     self,
@@ -1379,7 +1559,9 @@ class MainWindow(ctk.CTk):
             except AppError as exc:
                 duplicate_queue_errors.append(exc.user_message)
 
-        self._queue_view.refresh_all()
+        self._current_jobs_panel.refresh_all()
+        if self._full_queue_window is not None and self._full_queue_window.winfo_exists():
+            self._full_queue_window.refresh_all()
 
         if duplicate_queue_errors and added_count == 0:
             show_warning_dialog(self, "Cannot Add to Queue", duplicate_queue_errors[0])
@@ -1489,7 +1671,9 @@ class MainWindow(ctk.CTk):
                 logger.error("Ignored invalid or unexpected UI event %s: %s", event, exc)
 
         if needs_full_queue_refresh:
-            self._queue_view.refresh_all()
+            self._current_jobs_panel.refresh_all()
+            if self._full_queue_window is not None and self._full_queue_window.winfo_exists():
+                self._full_queue_window.refresh_all()
 
         self.after(100, self._poll_event_bus)
 
@@ -1500,6 +1684,10 @@ class MainWindow(ctk.CTk):
         job = event.data.get("job")
 
         if et == EventType.METADATA_FETCHED:
+            req_id = event.data.get("request_id")
+            if req_id is not None and req_id != self._metadata_request_id:
+                return
+
             self._fetch_info_btn.configure(state="normal", text="Fetch Info / Preview")
             meta: MediaMetadata | None = event.data.get("metadata")
             if meta is None:
@@ -1529,6 +1717,10 @@ class MainWindow(ctk.CTk):
             self._set_status_message(f"Loaded metadata: {meta.title}")
 
         elif et == EventType.METADATA_FAILED:
+            req_id = event.data.get("request_id")
+            if req_id is not None and req_id != self._metadata_request_id:
+                return
+
             self._fetch_info_btn.configure(state="normal", text="Fetch Info / Preview")
             msg = str(event.data.get("message") or "Could not fetch metadata.")
             rem = str(event.data.get("remedy") or "")
@@ -1542,7 +1734,9 @@ class MainWindow(ctk.CTk):
             EventType.JOB_PROCESSING,
         }:
             if job is not None and not job.status.is_terminal and job.status != JobStatus.PAUSED:
-                self._queue_view.refresh_job(job)
+                self._current_jobs_panel.refresh_job(job)
+                if self._full_queue_window is not None and self._full_queue_window.winfo_exists():
+                    self._full_queue_window.refresh_job(job)
 
         elif et == EventType.JOB_PAUSED:
             if job is not None:
@@ -1576,6 +1770,13 @@ class MainWindow(ctk.CTk):
             )
             if not confirm:
                 return
+
+        if self._full_queue_window is not None and self._full_queue_window.winfo_exists():
+            try:
+                self._full_queue_window.destroy()
+            except Exception:
+                pass
+            self._full_queue_window = None
 
         if self._metadata_cancel_event is not None:
             self._metadata_cancel_event.set()

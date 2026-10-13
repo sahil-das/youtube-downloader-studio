@@ -43,6 +43,50 @@ from src.utils.logging_config import get_logger
 logger = get_logger("queue_service")
 
 
+def select_current_jobs(jobs: list[DownloadJob], max_count: int = 2) -> list[DownloadJob]:
+    """Select up to max_count most relevant jobs according to the predictable priority rule:
+
+    1. Active or processing jobs first.
+    2. Paused jobs next, if space remains.
+    3. The next queued jobs, if space remains.
+    4. If all jobs are finished, show the most recent completed, failed, or cancelled jobs.
+    """
+    if not jobs or max_count <= 0:
+        return []
+
+    selected: list[DownloadJob] = []
+
+    # 1. Active or processing jobs
+    for job in jobs:
+        if job.status.is_active or job.status == JobStatus.PROCESSING:
+            selected.append(job)
+            if len(selected) >= max_count:
+                return selected
+
+    # 2. Paused jobs
+    for job in jobs:
+        if job.status == JobStatus.PAUSED and job not in selected:
+            selected.append(job)
+            if len(selected) >= max_count:
+                return selected
+
+    # 3. Next queued jobs
+    for job in jobs:
+        if job.status == JobStatus.QUEUED and job not in selected:
+            selected.append(job)
+            if len(selected) >= max_count:
+                return selected
+
+    # 4. Most recent terminal/finished jobs (in reverse insertion order)
+    for job in reversed(jobs):
+        if job.status.is_terminal and job not in selected:
+            selected.append(job)
+            if len(selected) >= max_count:
+                return selected
+
+    return selected[:max_count]
+
+
 class QueueService:
     """Manages queued, active, paused, and finished DownloadJobs with bounded background workers."""
 
@@ -409,6 +453,67 @@ class QueueService:
         if removed_count > 0 and self._event_bus is not None:
             self._event_bus.publish(EventType.QUEUE_UPDATED)
         return removed_count
+
+    def clear_failed_jobs(self) -> int:
+        """Remove failed and cancelled jobs from the active queue view."""
+        target_statuses = {JobStatus.FAILED, JobStatus.CANCELLED}
+        removed_count = 0
+        with self._lock:
+            to_remove = [
+                jid
+                for jid, job in self._jobs.items()
+                if job.status in target_statuses and jid not in self._active_threads
+            ]
+            for jid in to_remove:
+                self._jobs.pop(jid, None)
+                if jid in self._job_order:
+                    self._job_order.remove(jid)
+                self._cancel_events.pop(jid, None)
+                self._pause_events.pop(jid, None)
+                self._tracked_files.pop(jid, None)
+                removed_count += 1
+
+        if removed_count > 0 and self._event_bus is not None:
+            self._event_bus.publish(EventType.QUEUE_UPDATED)
+        return removed_count
+
+    def get_current_jobs(self, max_count: int = 2) -> list[DownloadJob]:
+        """Return at most max_count most relevant jobs for compact display."""
+        return select_current_jobs(self.list_jobs(), max_count=max_count)
+
+    def pause_all(self) -> int:
+        """Request cooperative pause for all actively running jobs and pause the queue."""
+        with self._lock:
+            self._processing_enabled = False
+            active_ids = [
+                jid for jid, job in self._jobs.items()
+                if job.status.is_active
+            ]
+        paused_count = 0
+        for jid in active_ids:
+            try:
+                if self.pause_job(jid):
+                    paused_count += 1
+            except Exception:
+                pass
+        return paused_count
+
+    def cancel_all(self) -> int:
+        """Cancel all queued, paused, and active jobs and stop the queue."""
+        with self._lock:
+            self._processing_enabled = False
+            non_terminal_ids = [
+                jid for jid, job in self._jobs.items()
+                if not job.status.is_terminal
+            ]
+        cancelled_count = 0
+        for jid in non_terminal_ids:
+            try:
+                if self.cancel_job(jid):
+                    cancelled_count += 1
+            except Exception:
+                pass
+        return cancelled_count
 
     def pause_job(self, job_id: str) -> bool:
         """Request cooperative pause for an actively running job.

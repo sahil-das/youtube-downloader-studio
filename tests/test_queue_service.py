@@ -361,3 +361,130 @@ def test_stress_30_queued_jobs_mixed_outcomes_no_thread_leaks(tmp_path: Path) ->
 
     # Verify all worker threads have exited
     assert threading.active_count() <= baseline_threads + 1
+
+
+def test_current_jobs_selection_priority(tmp_path: Path) -> None:
+    """Verify deterministic priority selection for Current Jobs panel (Section 2 & 6)."""
+    from src.services.queue_service import select_current_jobs
+
+    def _make_job(url: str, status: JobStatus) -> DownloadJob:
+        job = DownloadJob(url=url, destination_dir=tmp_path)
+        if status != JobStatus.QUEUED:
+            if status in {JobStatus.STARTING, JobStatus.DOWNLOADING, JobStatus.PROCESSING}:
+                job.transition_to(JobStatus.STARTING)
+                if status in {JobStatus.DOWNLOADING, JobStatus.PROCESSING}:
+                    job.transition_to(JobStatus.DOWNLOADING)
+                    if status == JobStatus.PROCESSING:
+                        job.transition_to(JobStatus.PROCESSING)
+            elif status == JobStatus.PAUSED:
+                job.transition_to(JobStatus.STARTING)
+                job.transition_to(JobStatus.DOWNLOADING)
+                job.transition_to(JobStatus.PAUSED)
+            elif status == JobStatus.COMPLETED:
+                job.transition_to(JobStatus.STARTING)
+                job.transition_to(JobStatus.DOWNLOADING)
+                job.transition_to(JobStatus.COMPLETED)
+            elif status == JobStatus.FAILED:
+                job.transition_to(JobStatus.STARTING)
+                job.transition_to(JobStatus.FAILED)
+            elif status == JobStatus.CANCELLED:
+                job.transition_to(JobStatus.CANCELLED)
+        return job
+
+    # Empty list
+    assert select_current_jobs([], max_count=2) == []
+
+    j_c1 = _make_job("https://example.com/c1", JobStatus.COMPLETED)
+    j_f1 = _make_job("https://example.com/f1", JobStatus.FAILED)
+    j_q1 = _make_job("https://example.com/q1", JobStatus.QUEUED)
+    j_q2 = _make_job("https://example.com/q2", JobStatus.QUEUED)
+    j_p1 = _make_job("https://example.com/p1", JobStatus.PAUSED)
+    j_a1 = _make_job("https://example.com/a1", JobStatus.DOWNLOADING)
+    j_c2 = _make_job("https://example.com/c2", JobStatus.COMPLETED)
+
+    all_jobs = [j_c1, j_f1, j_q1, j_q2, j_p1, j_a1, j_c2]
+
+    # Deterministic top 2: Active first, then Paused
+    top2 = select_current_jobs(all_jobs, max_count=2)
+    assert top2 == [j_a1, j_p1]
+
+    # Without active: Paused first, then Queued (first queued in order)
+    without_active = [j_c1, j_f1, j_q1, j_q2, j_p1, j_c2]
+    assert select_current_jobs(without_active, max_count=2) == [j_p1, j_q1]
+
+    # Without paused: Queued jobs in queue order
+    without_paused = [j_c1, j_f1, j_q1, j_q2, j_c2]
+    assert select_current_jobs(without_paused, max_count=2) == [j_q1, j_q2]
+
+    # Only terminal jobs: reverse insertion order (most recent terminal first: j_c2, then j_f1)
+    only_terminal = [j_c1, j_f1, j_c2]
+    assert select_current_jobs(only_terminal, max_count=2) == [j_c2, j_f1]
+    assert select_current_jobs(only_terminal, max_count=1) == [j_c2]
+
+
+def test_bulk_queue_operations_pause_cancel_clear_failed(tmp_path: Path) -> None:
+    """Verify pause_all, cancel_all, and clear_failed_jobs bulk operations."""
+    dl = FakeDownloadService()
+    dl.gate = threading.Event()  # Keep jobs running
+    bus = EventBus()
+    db = DatabaseManager(tmp_path / "bulk_test.db")
+    repo = HistoryRepository(db)
+
+    queue = QueueService(
+        download_service=dl,
+        history_repository=repo,
+        event_bus=bus,
+        max_concurrent_downloads=2,
+        auto_start=False,
+    )
+
+    try:
+        j1 = queue.add_job("https://www.youtube.com/watch?v=bulk_1", destination_dir=tmp_path)
+        j2 = queue.add_job("https://www.youtube.com/watch?v=bulk_2", destination_dir=tmp_path)
+        j3 = queue.add_job("https://www.youtube.com/watch?v=bulk_3", destination_dir=tmp_path)
+        j4 = queue.add_job("https://www.youtube.com/watch?v=bulk_4", destination_dir=tmp_path)
+
+        # 1. get_current_jobs on initial queue
+        current = queue.get_current_jobs(max_count=2)
+        assert len(current) == 2
+        assert current[0].job_id == j1.job_id
+        assert current[1].job_id == j2.job_id
+
+        # Start 2 jobs into active download
+        queue.start_queue()
+        # Give threads moment to reach downloading
+        for _ in range(50):
+            if j1.status == JobStatus.DOWNLOADING and j2.status == JobStatus.DOWNLOADING:
+                break
+            threading.Event().wait(0.02)
+
+        assert j1.status == JobStatus.DOWNLOADING
+        assert j2.status == JobStatus.DOWNLOADING
+        assert j3.status == JobStatus.QUEUED
+
+        # 2. pause_all pauses active jobs
+        paused_count = queue.pause_all()
+        assert paused_count == 2
+        # Unblock worker gate so workers process pause_event
+        dl.gate.set()
+        for _ in range(50):
+            if j1.status == JobStatus.PAUSED and j2.status == JobStatus.PAUSED:
+                break
+            threading.Event().wait(0.02)
+
+        assert j1.status == JobStatus.PAUSED
+        assert j2.status == JobStatus.PAUSED
+
+        # 3. cancel_all cancels remaining active, paused, and queued jobs
+        cancelled_count = queue.cancel_all()
+        assert cancelled_count == 4
+        assert all(j.status == JobStatus.CANCELLED for j in [j1, j2, j3, j4])
+
+        # 4. clear_failed_jobs removes failed and cancelled jobs
+        cleared = queue.clear_failed_jobs()
+        assert cleared == 4
+        assert queue.list_jobs() == []
+    finally:
+        if dl.gate is not None:
+            dl.gate.set()
+        queue.shutdown(timeout=2.0)

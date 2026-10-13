@@ -9,6 +9,8 @@ from typing import Callable
 import customtkinter as ctk  # type: ignore[import-untyped]
 
 from src.core.models import (
+    CaptionSource,
+    CaptionTrackInfo,
     DependencyStatus,
     MediaMetadata,
     OverwriteBehavior,
@@ -351,3 +353,299 @@ class DiagnosticsDialog(ctk.CTkToplevel):
         self._textbox.delete("1.0", "end")
         self._textbox.insert("1.0", "\n".join(lines))
         self._textbox.configure(state="disabled")
+
+
+class CaptionSelectionDialog(ctk.CTkToplevel):
+    """Modal dialog allowing users to search, filter, and choose caption/subtitle tracks."""
+
+    def __init__(
+        self,
+        parent: ctk.CTk | ctk.CTkBaseClass,
+        tracks: list[CaptionTrackInfo],
+        initial_selected_codes: list[str],
+        on_confirm: Callable[[list[str]], None] | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._tracks = list(tracks)
+        self._on_confirm = on_confirm
+        self._selected_codes: set[str] = set(initial_selected_codes)
+        self._current_category: str = "all"  # "all", "manual", "auto"
+        self._search_text: str = ""
+        self._checkbox_vars: dict[str, tk.BooleanVar] = {}
+
+        self.title("Choose Captions & Subtitles")
+        self.geometry("660x540")
+        self.minsize(540, 420)
+        self.transient(parent.winfo_toplevel())
+        try:
+            self.grab_set()
+        except Exception:
+            pass
+
+        self.protocol("WM_DELETE_WINDOW", self._on_cancel)
+
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(2, weight=1)
+
+        # Header
+        header = ctk.CTkFrame(self, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", padx=16, pady=(12, 4))
+        header.grid_columnconfigure(0, weight=1)
+
+        title_lbl = ctk.CTkLabel(
+            header,
+            text="Choose Captions & Subtitles",
+            font=ctk.CTkFont(size=15, weight="bold"),
+            anchor="w",
+        )
+        title_lbl.grid(row=0, column=0, sticky="w")
+
+        manual_cnt = sum(1 for t in self._tracks if t.source == CaptionSource.MANUAL)
+        auto_cnt = sum(1 for t in self._tracks if t.source == CaptionSource.AUTOMATIC)
+        sub_lbl = ctk.CTkLabel(
+            header,
+            text=f"{len(self._tracks)} track(s) reported by yt-dlp ({manual_cnt} manual, {auto_cnt} automatic).",
+            font=ctk.CTkFont(size=11),
+            text_color=("gray35", "gray70"),
+            anchor="w",
+        )
+        sub_lbl.grid(row=1, column=0, sticky="w", pady=(2, 0))
+
+        # Filter bar: Search input + Category segmented button + Select All / Clear
+        filter_bar = ctk.CTkFrame(self, fg_color="transparent")
+        filter_bar.grid(row=1, column=0, sticky="ew", padx=16, pady=(4, 6))
+        filter_bar.grid_columnconfigure(0, weight=1)
+
+        self._search_entry = ctk.CTkEntry(
+            filter_bar,
+            placeholder_text="Search language name or code (e.g. English, es)...",
+            height=28,
+            font=ctk.CTkFont(size=11),
+        )
+        self._search_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self._search_entry.bind("<KeyRelease>", self._on_search_key_released)
+
+        cat_labels = [f"All ({len(self._tracks)})", f"Manual ({manual_cnt})", f"Auto ({auto_cnt})"]
+        self._category_segmented = ctk.CTkSegmentedButton(
+            filter_bar,
+            values=cat_labels,
+            font=ctk.CTkFont(size=11),
+            height=28,
+            command=self._on_category_changed,
+        )
+        self._category_segmented.set(cat_labels[0])
+        self._category_segmented.grid(row=0, column=1, padx=(0, 8))
+
+        btn_box = ctk.CTkFrame(filter_bar, fg_color="transparent")
+        btn_box.grid(row=0, column=2, sticky="e")
+
+        ctk.CTkButton(
+            btn_box,
+            text="Select All",
+            width=70,
+            height=28,
+            font=ctk.CTkFont(size=11),
+            command=self._select_all_visible,
+        ).pack(side="left", padx=(0, 4))
+
+        ctk.CTkButton(
+            btn_box,
+            text="Clear",
+            width=54,
+            height=28,
+            font=ctk.CTkFont(size=11),
+            fg_color=("gray75", "gray30"),
+            text_color=("gray10", "gray90"),
+            command=self._deselect_all,
+        ).pack(side="left")
+
+        # Scrollable list
+        self._scroll = ctk.CTkScrollableFrame(self, label_text="Available Caption Tracks")
+        self._scroll.grid(row=2, column=0, sticky="nsew", padx=16, pady=4)
+        self._scroll.grid_columnconfigure(0, weight=1)
+
+        # Footer actions
+        footer = ctk.CTkFrame(self, fg_color="transparent")
+        footer.grid(row=3, column=0, sticky="ew", padx=16, pady=(8, 14))
+        footer.grid_columnconfigure(0, weight=1)
+
+        self._summary_lbl = ctk.CTkLabel(
+            footer,
+            text="",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            anchor="w",
+        )
+        self._summary_lbl.grid(row=0, column=0, sticky="w")
+
+        btn_footer = ctk.CTkFrame(footer, fg_color="transparent")
+        btn_footer.grid(row=0, column=1, sticky="e")
+
+        ctk.CTkButton(
+            btn_footer,
+            text="Cancel",
+            width=88,
+            height=30,
+            fg_color=("gray75", "gray30"),
+            text_color=("gray10", "gray90"),
+            command=self._on_cancel,
+        ).pack(side="left", padx=(0, 8))
+
+        ctk.CTkButton(
+            btn_footer,
+            text="Confirm Selection",
+            width=140,
+            height=30,
+            font=ctk.CTkFont(weight="bold"),
+            command=self._confirm_selected,
+        ).pack(side="left")
+
+        self._render_tracks()
+
+    def _get_filtered_tracks(self) -> list[CaptionTrackInfo]:
+        filtered: list[CaptionTrackInfo] = []
+        query = self._search_text.strip().lower()
+
+        for t in self._tracks:
+            # Category filter
+            if self._current_category == "manual" and t.source != CaptionSource.MANUAL:
+                continue
+            if self._current_category == "auto" and t.source != CaptionSource.AUTOMATIC:
+                continue
+
+            # Search filter
+            if query:
+                name_match = query in t.language_name.lower()
+                code_match = query in t.language_code.lower()
+                if not (name_match or code_match):
+                    continue
+
+            filtered.append(t)
+        return filtered
+
+    def _on_category_changed(self, choice: str) -> None:
+        if "Manual" in choice:
+            self._current_category = "manual"
+        elif "Auto" in choice:
+            self._current_category = "auto"
+        else:
+            self._current_category = "all"
+        self._render_tracks()
+
+    def _on_search_key_released(self, _event: object) -> None:
+        text = self._search_entry.get()
+        if text != self._search_text:
+            self._search_text = text
+            self._render_tracks()
+
+    def _on_checkbox_toggled(self, code: str, is_checked: bool) -> None:
+        if is_checked:
+            self._selected_codes.add(code)
+        else:
+            self._selected_codes.discard(code)
+        self._update_summary()
+
+    def _render_tracks(self) -> None:
+        for child in self._scroll.winfo_children():
+            child.destroy()
+        self._checkbox_vars.clear()
+
+        visible = self._get_filtered_tracks()
+
+        if not self._tracks:
+            empty_lbl = ctk.CTkLabel(
+                self._scroll,
+                text="No caption tracks available for this video.",
+                font=ctk.CTkFont(size=12),
+                text_color=("gray45", "gray60"),
+                justify="center",
+            )
+            empty_lbl.grid(row=0, column=0, pady=40)
+            self._update_summary()
+            return
+
+        if not visible:
+            empty_msg = (
+                f"No matching tracks for '{self._search_text}'."
+                if self._search_text
+                else f"No {self._current_category} tracks found."
+            )
+            empty_lbl = ctk.CTkLabel(
+                self._scroll,
+                text=empty_msg,
+                font=ctk.CTkFont(size=12),
+                text_color=("gray45", "gray60"),
+                justify="center",
+            )
+            empty_lbl.grid(row=0, column=0, pady=40)
+            self._update_summary()
+            return
+
+        for idx, track in enumerate(visible):
+            row_frame = ctk.CTkFrame(self._scroll, fg_color="transparent")
+            row_frame.grid(row=idx, column=0, sticky="ew", padx=6, pady=3)
+            row_frame.grid_columnconfigure(0, weight=1)
+
+            is_selected = track.language_code in self._selected_codes
+            cb_var = tk.BooleanVar(value=is_selected)
+            self._checkbox_vars[track.language_code] = cb_var
+
+            display_name = f"{track.language_name} ({track.language_code})"
+            cb = ctk.CTkCheckBox(
+                row_frame,
+                text=display_name,
+                variable=cb_var,
+                font=ctk.CTkFont(size=12),
+                checkbox_width=18,
+                checkbox_height=18,
+                command=lambda c=track.language_code, v=cb_var: self._on_checkbox_toggled(c, v.get()),
+            )
+            cb.grid(row=0, column=0, sticky="w")
+
+            is_manual = track.source == CaptionSource.MANUAL
+            badge_text = "Manual" if is_manual else "Auto"
+            badge_fg = ("#0284c7", "#0369a1") if is_manual else ("#64748b", "#475569")
+
+            badge = ctk.CTkLabel(
+                row_frame,
+                text=badge_text,
+                font=ctk.CTkFont(size=10, weight="bold"),
+                text_color="white",
+                corner_radius=4,
+                width=54,
+                height=20,
+                fg_color=badge_fg,
+            )
+            badge.grid(row=0, column=1, sticky="e", padx=(8, 4))
+
+        self._update_summary()
+
+    def _update_summary(self) -> None:
+        sel_count = len(self._selected_codes)
+        # Order codes matching tracks
+        ordered_codes = [t.language_code for t in self._tracks if t.language_code in self._selected_codes]
+        sel_str = ", ".join(ordered_codes) if ordered_codes else "None"
+        self._summary_lbl.configure(text=f"Selected: {sel_count} track(s) ({sel_str})")
+
+    def _select_all_visible(self) -> None:
+        visible = self._get_filtered_tracks()
+        for t in visible:
+            self._selected_codes.add(t.language_code)
+            var = self._checkbox_vars.get(t.language_code)
+            if var is not None:
+                var.set(True)
+        self._update_summary()
+
+    def _deselect_all(self) -> None:
+        self._selected_codes.clear()
+        for var in self._checkbox_vars.values():
+            var.set(False)
+        self._update_summary()
+
+    def _confirm_selected(self) -> None:
+        ordered_codes = [t.language_code for t in self._tracks if t.language_code in self._selected_codes]
+        if self._on_confirm is not None:
+            self._on_confirm(ordered_codes)
+        self.destroy()
+
+    def _on_cancel(self) -> None:
+        self.destroy()
