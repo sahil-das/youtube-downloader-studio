@@ -29,6 +29,7 @@ data/
 # Build artifacts
 build/
 dist/
+*.spec
 *.spec.bak
 
 # IDE and operating system
