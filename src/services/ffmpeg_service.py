@@ -1,15 +1,37 @@
-"""Dependency discovery and diagnostics for yt-dlp, FFmpeg, and FFprobe."""
+"""Dependency discovery, local media probing, trimming, and soft-subtitle muxing via FFmpeg/FFprobe."""
 
 from __future__ import annotations
 
+import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
-from src.core.models import DependencyStatus
+from src.core.exceptions import (
+    DownloadCancelledError,
+    DownloadError,
+    FFmpegMissingError,
+    ValidationError,
+)
+from src.core.models import (
+    AudioFormat,
+    AudioQuality,
+    DependencyStatus,
+    LocalMediaInfo,
+)
+from src.core.validators import (
+    SUPPORTED_LOCAL_AUDIO_EXTENSIONS,
+    format_timestamp,
+    parse_timestamp,
+    validate_local_media_path,
+    validate_trim_range,
+)
 from src.utils.logging_config import get_logger
 
 logger = get_logger("ffmpeg_service")
@@ -20,9 +42,15 @@ _WINDOWS_COMMON_FFMPEG_DIRS: tuple[str, ...] = (
     r"C:\ProgramData\chocolatey\bin",
 )
 
+_FFMPEG_DURATION_RE = re.compile(r"Duration:\s*(\d{2}:\d{2}:\d{2}(?:\.\d+)?)", re.IGNORECASE)
+_FFMPEG_STREAM_RE = re.compile(
+    r"Stream\s+#\d+:\d+.*?:\s*(Video|Audio|Subtitle):\s*([A-Za-z0-9_]+)?",
+    re.IGNORECASE,
+)
+
 
 class FFmpegService:
-    """Detects and verifies FFmpeg, FFprobe, and yt-dlp without executing untrusted shells."""
+    """Detects and executes FFmpeg and FFprobe safely without invoking untrusted shells."""
 
     def __init__(self, custom_ffmpeg_path: str = "") -> None:
         self._custom_path = custom_ffmpeg_path.strip()
@@ -154,6 +182,16 @@ class FFmpegService:
         """Return True if a working ffmpeg executable is available."""
         return self.check_dependencies().ffmpeg_available
 
+    def get_ffmpeg_binary_path(self) -> Path:
+        """Return the resolved Path to ffmpeg.exe or raise FFmpegMissingError."""
+        status = self.check_dependencies()
+        if not status.ffmpeg_available or not status.ffmpeg_path:
+            raise FFmpegMissingError(
+                "FFmpeg is required for this operation, but was not detected on your system.",
+                remedy=self.get_missing_ffmpeg_explanation(),
+            )
+        return Path(status.ffmpeg_path)
+
     def get_ffmpeg_location_for_ytdlp(self) -> str | None:
         """Return the directory or binary path to pass as `ffmpeg_location` to yt-dlp."""
         status = self.check_dependencies()
@@ -166,6 +204,496 @@ class FFmpegService:
                 return str(path_obj.parent)
         return str(path_obj)
 
+    def run_cancellable_command(
+        self,
+        args: list[str],
+        cancel_event: threading.Event | None = None,
+        timeout_seconds: float = 1800.0,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run a subprocess argument list safely with cooperative cancellation polling."""
+        if cancel_event is not None and cancel_event.is_set():
+            raise DownloadCancelledError("Media processing cancelled by user.")
+
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
+        try:
+            proc = subprocess.Popen(
+                args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=creationflags,
+            )
+        except OSError as exc:
+            raise DownloadError(
+                f"Failed to start media processing command: {exc}",
+                remedy="Check that FFmpeg is properly installed and accessible.",
+            ) from exc
+
+        start_time = time.monotonic()
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                self._terminate_process(proc)
+                raise DownloadCancelledError("Media processing cancelled by user.")
+
+            if (time.monotonic() - start_time) > timeout_seconds:
+                self._terminate_process(proc)
+                raise DownloadError(
+                    "FFmpeg processing timed out.",
+                    remedy="Try trimming a shorter segment or using Fast Stream Copy mode.",
+                )
+
+            try:
+                stdout_str, stderr_str = proc.communicate(timeout=0.05)
+                return subprocess.CompletedProcess(
+                    args=args,
+                    returncode=proc.returncode or 0,
+                    stdout=stdout_str or "",
+                    stderr=stderr_str or "",
+                )
+            except subprocess.TimeoutExpired:
+                continue
+
+    @staticmethod
+    def _terminate_process(proc: subprocess.Popen[str]) -> None:
+        """Terminate and, if necessary, kill a running subprocess cleanly."""
+        try:
+            proc.terminate()
+            proc.wait(timeout=1.5)
+        except Exception:
+            try:
+                proc.kill()
+                proc.wait(timeout=1.0)
+            except Exception:
+                pass
+
+    def probe_local_media(self, file_path: Path | str) -> LocalMediaInfo:
+        """Inspect a local video or audio file using FFprobe (or FFmpeg -i fallback when FFprobe is absent)."""
+        validated_path = validate_local_media_path(file_path)
+        status = self.check_dependencies()
+
+        if status.ffprobe_available and status.ffprobe_path:
+            return self._probe_with_ffprobe(Path(status.ffprobe_path), validated_path)
+
+        if status.ffmpeg_available and status.ffmpeg_path:
+            return self._probe_with_ffmpeg_stderr(Path(status.ffmpeg_path), validated_path)
+
+        raise FFmpegMissingError(
+            "Inspecting local media files requires FFmpeg or FFprobe, neither of which was detected.",
+            remedy=self.get_missing_ffmpeg_explanation(),
+        )
+
+    def _probe_with_ffprobe(self, ffprobe_bin: Path, media_path: Path) -> LocalMediaInfo:
+        """Inspect media duration and stream layout via ffprobe JSON output."""
+        proc = self.run_cancellable_command(
+            [
+                str(ffprobe_bin),
+                "-v",
+                "quiet",
+                "-print_format",
+                "json",
+                "-show_format",
+                "-show_streams",
+                str(media_path),
+            ],
+            timeout_seconds=20.0,
+        )
+        if proc.returncode != 0 or not proc.stdout.strip():
+            # Fallback to ffmpeg stderr if ffprobe exists alongside ffmpeg
+            status = self.check_dependencies()
+            if status.ffmpeg_available and status.ffmpeg_path:
+                return self._probe_with_ffmpeg_stderr(Path(status.ffmpeg_path), media_path)
+            raise DownloadError(
+                f"Could not inspect media file '{media_path.name}'. The file may be corrupted or unsupported.",
+                remedy="Choose a valid video or audio file.",
+            )
+
+        try:
+            payload = json.loads(proc.stdout)
+        except json.JSONDecodeError as exc:
+            raise DownloadError(
+                f"Could not parse media stream metadata for '{media_path.name}'.",
+                remedy="Verify the media file is not corrupted.",
+            ) from exc
+
+        streams = payload.get("streams") if isinstance(payload, dict) else None
+        fmt_info = payload.get("format") if isinstance(payload, dict) else None
+
+        has_video = False
+        has_audio = False
+        v_codec: str | None = None
+        a_codec: str | None = None
+        sub_count = 0
+        max_stream_dur = 0.0
+
+        if isinstance(streams, list):
+            for st in streams:
+                if not isinstance(st, dict):
+                    continue
+                codec_type = str(st.get("codec_type") or "").lower()
+                codec_name = str(st.get("codec_name") or "").strip() or None
+                st_dur = self._safe_float(st.get("duration"))
+                if st_dur and st_dur > max_stream_dur:
+                    max_stream_dur = st_dur
+
+                if codec_type == "video" and codec_name not in {"mjpeg", "png", "webp"}:
+                    has_video = True
+                    v_codec = v_codec or codec_name
+                elif codec_type == "audio":
+                    has_audio = True
+                    a_codec = a_codec or codec_name
+                elif codec_type == "subtitle":
+                    sub_count += 1
+
+        fmt_dur = self._safe_float(fmt_info.get("duration")) if isinstance(fmt_info, dict) else None
+        duration = fmt_dur if (fmt_dur and fmt_dur > 0) else max_stream_dur
+
+        if not has_video and not has_audio:
+            raise DownloadError(
+                f"No playable video or audio streams were found in '{media_path.name}'.",
+                remedy="Select a valid video or audio file.",
+            )
+
+        if duration <= 0:
+            raise DownloadError(
+                f"Could not determine a valid duration for '{media_path.name}'.",
+                remedy="Ensure the media file has a valid header and duration.",
+            )
+
+        container = (
+            str(fmt_info.get("format_name") or "")
+            if isinstance(fmt_info, dict)
+            else media_path.suffix.lstrip(".")
+        )
+        return LocalMediaInfo(
+            file_path=media_path,
+            duration_seconds=round(duration, 3),
+            has_video=has_video,
+            has_audio=has_audio,
+            video_codec=v_codec,
+            audio_codec=a_codec,
+            subtitle_streams=sub_count,
+            container_format=container,
+        )
+
+    def _probe_with_ffmpeg_stderr(self, ffmpeg_bin: Path, media_path: Path) -> LocalMediaInfo:
+        """Inspect media duration and streams by parsing `ffmpeg -hide_banner -i <file>` stderr output."""
+        proc = self.run_cancellable_command(
+            [str(ffmpeg_bin), "-hide_banner", "-i", str(media_path)],
+            timeout_seconds=20.0,
+        )
+        output = f"{proc.stderr}\n{proc.stdout}"
+        dur_match = _FFMPEG_DURATION_RE.search(output)
+        if not dur_match:
+            raise DownloadError(
+                f"Could not inspect media file '{media_path.name}'. It may be corrupted or an unsupported format.",
+                remedy="Choose a valid, playable video or audio file.",
+            )
+
+        try:
+            duration = parse_timestamp(dur_match.group(1))
+        except ValidationError as exc:
+            raise DownloadError(
+                f"Could not parse duration of '{media_path.name}'.",
+                remedy="Verify the file is a valid video or audio recording.",
+            ) from exc
+
+        if duration <= 0:
+            raise DownloadError(
+                f"Media file '{media_path.name}' reported a duration of 0 seconds.",
+                remedy="Choose a media file with a non-zero duration.",
+            )
+
+        has_video = False
+        has_audio = False
+        v_codec: str | None = None
+        a_codec: str | None = None
+        sub_count = 0
+
+        for match in _FFMPEG_STREAM_RE.finditer(output):
+            kind = match.group(1).lower()
+            codec = (match.group(2) or "").lower() or None
+            if kind == "video" and codec not in {"mjpeg", "png", "webp"}:
+                has_video = True
+                v_codec = v_codec or codec
+            elif kind == "audio":
+                has_audio = True
+                a_codec = a_codec or codec
+            elif kind == "subtitle":
+                sub_count += 1
+
+        if not has_video and not has_audio:
+            raise DownloadError(
+                f"No video or audio streams were detected in '{media_path.name}'.",
+                remedy="Select a valid video or audio file.",
+            )
+
+        return LocalMediaInfo(
+            file_path=media_path,
+            duration_seconds=round(duration, 3),
+            has_video=has_video,
+            has_audio=has_audio,
+            video_codec=v_codec,
+            audio_codec=a_codec,
+            subtitle_streams=sub_count,
+            container_format=media_path.suffix.lower().lstrip("."),
+        )
+
+    def trim_media_file(
+        self,
+        source_path: Path | str,
+        output_path: Path | str,
+        start_seconds: float,
+        end_seconds: float,
+        accurate_trim: bool = True,
+        audio_only_output: bool = False,
+        audio_format: AudioFormat = AudioFormat.MP3,
+        audio_quality: AudioQuality = AudioQuality.K192,
+        cancel_event: threading.Event | None = None,
+        probed_info: LocalMediaInfo | None = None,
+        audio_only: bool | None = None,
+    ) -> Path:
+        """Trim a local video or audio file into a new output file without modifying the source file."""
+        if audio_only is not None:
+            audio_only_output = audio_only
+        ffmpeg_bin = self.get_ffmpeg_binary_path()
+        src = validate_local_media_path(source_path)
+        info = probed_info or self.probe_local_media(src)
+
+        valid_start, valid_end = validate_trim_range(
+            start_seconds,
+            end_seconds,
+            media_duration=info.duration_seconds,
+        )
+        clip_duration = round(valid_end - valid_start, 3)
+
+        out = Path(output_path).expanduser().resolve()
+        # Safety guarantee: never overwrite the original source file in-place
+        if out == src:
+            ts_tag = (
+                f"{format_timestamp(valid_start).replace(':', '-')}_to_"
+                f"{format_timestamp(valid_end).replace(':', '-')}"
+            )
+            out = src.with_name(f"{src.stem}_trimmed_{ts_tag}{src.suffix}")
+
+        out.parent.mkdir(parents=True, exist_ok=True)
+        temp_out = out.with_name(f".ytd_trim_tmp_{out.name}")
+
+        is_source_audio_only = (not info.has_video) or (src.suffix.lower() in SUPPORTED_LOCAL_AUDIO_EXTENSIONS)
+        produce_audio_only = audio_only_output or is_source_audio_only
+
+        if produce_audio_only and not info.has_audio:
+            raise DownloadError(
+                f"Cannot extract an audio clip from '{src.name}' because it contains no audio stream.",
+                remedy="Use Video mode to trim this video-only file.",
+            )
+
+        args: list[str] = [
+            str(ffmpeg_bin),
+            "-hide_banner",
+            "-y",
+            "-ss",
+            f"{valid_start:.3f}",
+            "-i",
+            str(src),
+            "-t",
+            f"{clip_duration:.3f}",
+        ]
+
+        if produce_audio_only:
+            args.append("-vn")
+            target_ext = out.suffix.lower().lstrip(".")
+            if not accurate_trim and target_ext == src.suffix.lower().lstrip("."):
+                args.extend(["-c:a", "copy"])
+            else:
+                codec_args = self._build_audio_codec_args(target_ext, audio_format, audio_quality)
+                args.extend(codec_args)
+        else:
+            if not accurate_trim:
+                args.extend(["-c", "copy"])
+            else:
+                target_ext = out.suffix.lower().lstrip(".")
+                if target_ext == "webm":
+                    args.extend(["-c:v", "libvpx-vp9", "-crf", "30", "-b:v", "0"])
+                    if info.has_audio:
+                        args.extend(["-c:a", "libopus"])
+                else:
+                    args.extend(["-c:v", "libx264", "-preset", "fast", "-crf", "18"])
+                    if info.has_audio:
+                        args.extend(["-c:a", "aac", "-b:a", "192k"])
+                    else:
+                        args.append("-an")
+
+        args.append(str(temp_out))
+        logger.info(
+            "Running FFmpeg trim: %s [%.2fs -> %.2fs] -> %s",
+            src.name,
+            valid_start,
+            valid_end,
+            out.name,
+        )
+
+        try:
+            proc = self.run_cancellable_command(args, cancel_event=cancel_event)
+            if proc.returncode != 0:
+                err_tail = "\n".join(proc.stderr.strip().splitlines()[-4:]) if proc.stderr else "Unknown FFmpeg error"
+                raise DownloadError(
+                    f"FFmpeg failed while trimming '{src.name}': {err_tail}",
+                    remedy="Try toggling 'Accurate Cut (Re-encode)' or choosing an MP4/MKV output format.",
+                )
+
+            if not temp_out.exists() or temp_out.stat().st_size <= 0:
+                raise DownloadError(
+                    f"Trimming produced an empty or missing output file for '{src.name}'.",
+                    remedy="Verify the start and end timestamps fall within a playable section of the file.",
+                )
+
+            temp_out.replace(out)
+            return out
+        except Exception:
+            try:
+                temp_out.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+
+    @staticmethod
+    def _build_audio_codec_args(
+        target_ext: str,
+        audio_format: AudioFormat,
+        audio_quality: AudioQuality,
+    ) -> list[str]:
+        """Return FFmpeg audio encoder arguments for a target extension."""
+        ext = target_ext or audio_format.value
+        bitrate = f"{audio_quality.value}k" if audio_quality != AudioQuality.BEST else "256k"
+        if ext == "mp3":
+            return ["-c:a", "libmp3lame", "-b:a", bitrate]
+        if ext == "wav":
+            return ["-c:a", "pcm_s16le"]
+        if ext == "flac":
+            return ["-c:a", "flac"]
+        if ext in {"opus", "ogg"}:
+            return ["-c:a", "libopus", "-b:a", bitrate]
+        return ["-c:a", "aac", "-b:a", bitrate]
+
+    def embed_soft_subtitles(
+        self,
+        video_path: Path | str,
+        subtitle_tracks: list[tuple[Path, str]],
+        cancel_event: threading.Event | None = None,
+    ) -> Path:
+        """Mux one or more subtitle files as soft subtitle streams into a video container without re-encoding video/audio.
+
+        Preserves the original video file untouched if muxing or verification fails.
+        """
+        ffmpeg_bin = self.get_ffmpeg_binary_path()
+        vid = Path(video_path).expanduser().resolve()
+        if not vid.exists() or not vid.is_file():
+            raise DownloadError(
+                f"Cannot embed subtitles because video file '{vid.name}' does not exist.",
+                remedy="Ensure the video download succeeded before embedding subtitles.",
+            )
+
+        valid_subs = [(Path(p).resolve(), lang) for p, lang in subtitle_tracks if Path(p).exists() and Path(p).stat().st_size > 0]
+        if not valid_subs:
+            raise DownloadError(
+                "No valid subtitle files were available to embed into the video.",
+                remedy="Verify the selected caption language exists for this video.",
+            )
+
+        ext = vid.suffix.lower()
+        if ext in {".mp4", ".m4v", ".mov"}:
+            sub_codec = "mov_text"
+        elif ext == ".mkv":
+            sub_codec = "srt"
+        elif ext == ".webm":
+            sub_codec = "webvtt"
+        else:
+            raise DownloadError(
+                f"Container format '{ext}' does not support soft-subtitle embedding.",
+                remedy="Select MP4, MKV, or WebM as the video format when embedding soft subtitles.",
+            )
+
+        temp_muxed = vid.with_name(f".ytd_submux_tmp_{vid.name}")
+        args: list[str] = [
+            str(ffmpeg_bin),
+            "-hide_banner",
+            "-y",
+            "-i",
+            str(vid),
+        ]
+        for sub_file, _lang in valid_subs:
+            args.extend(["-i", str(sub_file)])
+
+        args.extend(["-map", "0:v?", "-map", "0:a?"])
+        for idx in range(len(valid_subs)):
+            args.extend(["-map", f"{idx + 1}:0"])
+
+        args.extend(["-c:v", "copy", "-c:a", "copy", "-c:s", sub_codec])
+
+        for idx, (_sub_file, lang_code) in enumerate(valid_subs):
+            iso_lang = (lang_code or "und").split("-")[0][:3].lower()
+            args.extend(
+                [
+                    f"-metadata:s:s:{idx}",
+                    f"language={iso_lang}",
+                    f"-metadata:s:s:{idx}",
+                    f"title={lang_code}",
+                ]
+            )
+
+        args.append(str(temp_muxed))
+        logger.info("Embedding %d soft-subtitle track(s) into %s (codec=%s)", len(valid_subs), vid.name, sub_codec)
+
+        try:
+            proc = self.run_cancellable_command(args, cancel_event=cancel_event)
+            if proc.returncode != 0:
+                err_tail = "\n".join(proc.stderr.strip().splitlines()[-4:]) if proc.stderr else "Unknown FFmpeg mux error"
+                raise DownloadError(
+                    f"Soft-subtitle embedding failed for '{vid.name}': {err_tail}",
+                    remedy="Choose MKV or MP4 container format, or keep separate subtitle files.",
+                )
+
+            if not temp_muxed.exists() or temp_muxed.stat().st_size <= 0:
+                raise DownloadError(
+                    f"Subtitle muxing produced an empty output file for '{vid.name}'.",
+                    remedy="Keep separate subtitle files or try MKV container format.",
+                )
+
+            if not self.verify_subtitle_streams(temp_muxed, min_streams=len(valid_subs)):
+                raise DownloadError(
+                    f"Output verification failed: embedded subtitle stream was not detected in '{vid.name}'.",
+                    remedy="Try using MKV or MP4 container format.",
+                )
+
+            temp_muxed.replace(vid)
+            return vid
+        except Exception:
+            try:
+                temp_muxed.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+
+    def verify_subtitle_streams(self, video_path: Path | str, min_streams: int = 1) -> bool:
+        """Return True if the video container exists and has at least `min_streams` subtitle streams."""
+        try:
+            info = self.probe_local_media(video_path)
+            return info.subtitle_streams >= min_streams
+        except Exception as exc:
+            logger.warning("Subtitle stream verification failed for %s: %s", video_path, exc)
+            return False
+
+    @staticmethod
+    def _safe_float(val: object) -> float | None:
+        if val is None:
+            return None
+        try:
+            return float(str(val))
+        except (TypeError, ValueError):
+            return None
+
     @staticmethod
     def get_missing_ffmpeg_explanation() -> str:
         """Return a clear explanation of what requires FFmpeg and how to install or configure it."""
@@ -174,8 +702,11 @@ class FFmpegService:
             "Features requiring FFmpeg:\n"
             "• Merging separate high-resolution video and audio streams (e.g., 1080p/1440p/4K)\n"
             "• Converting audio streams into MP3, WAV, Opus, or FLAC\n"
-            "• Remuxing containers when required\n\n"
-            "Available without FFmpeg:\n"
+            "• Video and audio segment trimming (YouTube URL clips and local file trimming)\n"
+            "• Embedding soft subtitles into MP4, MKV, or WebM containers\n\n"
+            "Available WITHOUT FFmpeg:\n"
+            "• Standalone 'Captions Only' mode (downloads & exports SRT, VTT, and TXT in pure Python)\n"
+            "• Separate subtitle file downloads alongside progressive videos\n"
             "• Pre-merged progressive video streams (typically up to 720p MP4)\n"
             "• Native audio streams ('Best Audio Stream' or native M4A)\n\n"
             "How to install FFmpeg on Windows:\n"

@@ -131,7 +131,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if args.smoke_test_ui:
-        app.after(600, app.destroy)
+        app.after(400, app._on_close_window)
 
     app.mainloop()
     return 0

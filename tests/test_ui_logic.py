@@ -11,13 +11,18 @@ import pytest
 from src.core.events import AppEvent, EventBus, EventType
 from src.core.models import (
     AudioFormat,
+    CaptionSource,
+    CaptionTrackInfo,
     DependencyStatus,
     DownloadJob,
     DownloadMode,
     JobStatus,
+    LocalMediaInfo,
     MediaMetadata,
     PlaylistItemInfo,
     PlaylistMode,
+    SourceType,
+    SubtitleFormat,
     ThemeMode,
 )
 from src.database.db import DatabaseManager
@@ -56,6 +61,18 @@ class ControllableFFmpegService(FFmpegService):
             ffprobe_path="C:/ffmpeg/bin/ffprobe.exe" if self.ffprobe_ok else None,
             ffmpeg_version="ffmpeg version 7.0" if self.ffmpeg_ok else None,
             ffprobe_version="ffprobe version 7.0" if self.ffprobe_ok else None,
+        )
+
+    def probe_local_media(self, file_path: Path | str) -> LocalMediaInfo:
+        resolved = Path(file_path).resolve()
+        return LocalMediaInfo(
+            file_path=resolved,
+            duration_seconds=180.0,
+            has_video=True,
+            has_audio=True,
+            video_codec="h264",
+            audio_codec="aac",
+            container_format="mp4",
         )
 
 
@@ -322,5 +339,110 @@ def test_main_window_complete_user_workflows(
         # 10. Malformed event resilience on EventBus
         win._handle_single_event(AppEvent(event_type=EventType.JOB_PROGRESS, data={"job": None}))
         win._queue_view._handle_clear_completed()
+
+        # 11. TrimTimelineWidget two-way synchronization and clamping
+        win._nav_segmented.set("Downloader & Queue")
+        win._on_navigation_changed("Downloader & Queue")
+        win._source_selector.set("YouTube URL")
+        win._on_source_type_changed("YouTube URL")
+        win._mode_selector.set("Video")
+        win._on_mode_changed("Video")
+
+        timeline = win._trim_timeline
+        timeline.set_enabled(True)
+        timeline.set_media_duration(300.0)
+        assert timeline.media_duration == 300.0
+        assert timeline.clip_duration == 300.0
+
+        timeline._start_entry.delete(0, "end")
+        timeline._start_entry.insert(0, "00:30")
+        timeline._end_entry.delete(0, "end")
+        timeline._end_entry.insert(0, "02:00")
+        assert timeline.apply_entry_inputs() is True
+        assert timeline.start_seconds == 30.0
+        assert timeline.end_seconds == 120.0
+        assert timeline.clip_duration == 90.0
+
+        # Moving handle updates text entry
+        timeline.set_handle_seconds("start", 45.0)
+        assert timeline.get_start_text() == "00:45"
+        assert timeline.start_seconds == 45.0
+
+        # Clamping: moving start past end clamps to end - MIN_CLIP_SECONDS
+        timeline.set_handle_seconds("start", 250.0)
+        assert timeline.start_seconds <= 120.0 - timeline.MIN_CLIP_SECONDS
+        assert timeline.start_seconds < timeline.end_seconds
+
+        # 12. Captions Only mode UI switching, track menu population, and FFmpeg-free queuing
+        dialog_calls.clear()
+        win._mode_selector.set("Captions Only")
+        win._on_mode_changed("Captions Only")
+
+        # In Captions Only mode, captions row is active and trim timeline is hidden
+        assert win._captions_row.winfo_ismapped() or win._captions_row.grid_info() != {}
+        assert win._trim_timeline.grid_info() == {}
+
+        # Populate caption track menu from discovered metadata tracks
+        meta_with_captions = MediaMetadata(
+            url="https://www.youtube.com/watch?v=caption_ui_test",
+            webpage_url="https://www.youtube.com/watch?v=caption_ui_test",
+            video_id="caption_ui_test",
+            title="Captions UI Video",
+            caption_tracks=[
+                CaptionTrackInfo(lang_code="en", name="English", source=CaptionSource.MANUAL),
+                CaptionTrackInfo(lang_code="es", name="Spanish", source=CaptionSource.AUTOMATIC),
+            ],
+        )
+        win._include_auto_captions_var.set(True)
+        win._update_discovered_caption_tracks(meta_with_captions)
+        assert any("English" in opt for opt in win._caption_track_menu.cget("values"))
+        assert any("Spanish" in opt for opt in win._caption_track_menu.cget("values"))
+
+        # Select Spanish track
+        chosen_opt = next(opt for opt in win._caption_track_menu.cget("values") if "Spanish" in opt)
+        win._caption_track_menu.set(chosen_opt)
+        win._on_caption_track_selected(chosen_opt)
+        assert win._subtitle_langs_entry.get().strip() == "es"
+
+        # Captions Only mode can be queued even when FFmpeg is missing
+        ffmpeg_service.ffmpeg_ok = False
+        win._refresh_dependency_status_ui()
+        win._url_textbox.delete("1.0", "end")
+        win._url_textbox.insert("1.0", "https://www.youtube.com/watch?v=caption_ui_test")
+        win._submit_urls(start_immediately=False)
+
+        queued_cap_job = queue_service.list_jobs()[-1]
+        assert queued_cap_job.mode == DownloadMode.CAPTIONS
+        assert queued_cap_job.subtitle_languages == ["es"]
+        assert queued_cap_job.url == "https://www.youtube.com/watch?v=caption_ui_test"
+
+        # 13. Local Media File source mode, inspection, and local trim submission
+        ffmpeg_service.ffmpeg_ok = True
+        win._refresh_dependency_status_ui()
+
+        local_vid = tmp_path / "sample_local.mp4"
+        local_vid.write_bytes(b"local-media-file-bytes" * 50)
+
+        win._source_selector.set("Local Media File")
+        win._on_source_type_changed("Local Media File")
+        assert win._local_path_entry.winfo_ismapped() or win._local_path_entry.grid_info() != {}
+        assert win._url_textbox.grid_info() == {}
+
+        win._local_path_entry.delete(0, "end")
+        win._local_path_entry.insert(0, str(local_vid))
+        win._inspect_local_media_file()
+
+        assert win._current_local_media is not None
+        assert win._current_local_media.path == local_vid.resolve()
+        assert win._trim_timeline.media_duration == 180.0
+
+        win._trim_timeline.set_range_seconds(15.0, 75.0)
+        win._submit_local_trim_job(start_immediately=False)
+
+        queued_trim_job = queue_service.list_jobs()[-1]
+        assert queued_trim_job.source_type == SourceType.LOCAL_FILE
+        assert queued_trim_job.local_source_path == local_vid.resolve()
+        assert queued_trim_job.trim_start_seconds == 15.0
+        assert queued_trim_job.trim_end_seconds == 75.0
     finally:
         win._on_close_window()

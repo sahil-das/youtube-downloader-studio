@@ -15,6 +15,7 @@ from src.core.models import (
     AudioQuality,
     DownloadMode,
     OverwriteBehavior,
+    SubtitleFormat,
     ThemeMode,
     VideoFormat,
     VideoQuality,
@@ -115,7 +116,7 @@ class SettingsView(ctk.CTkFrame):
         )
         self._mode_menu = ctk.CTkOptionMenu(
             form,
-            values=[DownloadMode.VIDEO.value, DownloadMode.AUDIO.value],
+            values=[DownloadMode.VIDEO.value, DownloadMode.AUDIO.value, DownloadMode.CAPTIONS.value],
             width=200,
         )
         self._mode_menu.grid(row=row_idx, column=1, sticky="w", padx=10, pady=8)
@@ -163,6 +164,42 @@ class SettingsView(ctk.CTkFrame):
             width=120,
         )
         self._audio_quality_menu.pack(side="left")
+        row_idx += 1
+
+        # 4b. Default Subtitle & Caption Preferences
+        ctk.CTkLabel(form, text="Default Subtitle & Caption Options:", font=ctk.CTkFont(weight="bold")).grid(
+            row=row_idx, column=0, sticky="w", padx=10, pady=8
+        )
+        sub_frame = ctk.CTkFrame(form, fg_color="transparent")
+        sub_frame.grid(row=row_idx, column=1, sticky="w", padx=10, pady=8)
+
+        self._subtitle_format_menu = ctk.CTkOptionMenu(
+            sub_frame,
+            values=[f.value for f in SubtitleFormat],
+            width=100,
+        )
+        self._subtitle_format_menu.pack(side="left", padx=(0, 12))
+
+        self._include_auto_captions_var = tk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            sub_frame,
+            text="Include auto-captions",
+            variable=self._include_auto_captions_var,
+        ).pack(side="left", padx=(0, 12))
+
+        self._embed_subtitles_var = tk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            sub_frame,
+            text="Embed soft subtitles",
+            variable=self._embed_subtitles_var,
+        ).pack(side="left", padx=(0, 12))
+
+        self._keep_subtitle_files_var = tk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            sub_frame,
+            text="Keep separate subtitle files",
+            variable=self._keep_subtitle_files_var,
+        ).pack(side="left")
         row_idx += 1
 
         # 5. Appearance Theme
@@ -310,6 +347,10 @@ class SettingsView(ctk.CTkFrame):
         self._video_format_menu.set(settings.default_video_format.value)
         self._audio_format_menu.set(settings.default_audio_format.value)
         self._audio_quality_menu.set(settings.default_audio_quality.value)
+        self._subtitle_format_menu.set(settings.default_subtitle_format.value)
+        self._include_auto_captions_var.set(settings.default_include_auto_captions)
+        self._embed_subtitles_var.set(settings.default_embed_subtitles)
+        self._keep_subtitle_files_var.set(settings.default_keep_subtitle_files)
         self._theme_menu.set(settings.theme_mode.value)
         self._concurrency_menu.set(str(settings.max_concurrent_downloads))
 
@@ -376,6 +417,10 @@ class SettingsView(ctk.CTkFrame):
             default_video_format=VideoFormat(self._video_format_menu.get()),
             default_audio_format=AudioFormat(self._audio_format_menu.get()),
             default_audio_quality=AudioQuality(self._audio_quality_menu.get()),
+            default_subtitle_format=SubtitleFormat(self._subtitle_format_menu.get()),
+            default_include_auto_captions=bool(self._include_auto_captions_var.get()),
+            default_embed_subtitles=bool(self._embed_subtitles_var.get()),
+            default_keep_subtitle_files=bool(self._keep_subtitle_files_var.get()),
             theme_mode=ThemeMode(self._theme_menu.get()),
             max_concurrent_downloads=int(self._concurrency_menu.get()),
             filename_template=self._template_entry.get().strip(),

@@ -63,7 +63,33 @@ Or run Python directly from `.venv` without activating:
 
 ---
 
-## 5. Inspecting Application Logs
+## 5. Video/Audio Trimming & Timestamp Validation
+
+### Symptoms
+- "Start time must be less than end time" or "End time exceeds total media duration".
+- Trimming is blocked with "FFmpeg Required for Segment Trimming".
+
+### Causes & Remedies
+- **Timestamp Formats**: Enter timestamps as `SS` (e.g., `45`), `MM:SS` (e.g., `01:30`), or `HH:MM:SS` (e.g., `01:05:20`), with optional milliseconds (`.500`). Alternatively, drag the blue start/end handles on the interactive visual timeline.
+- **Minimum Clip Duration**: The selected clip must be at least `0.5` seconds long and within the inspected duration of the video or local file.
+- **FFmpeg Requirement**: Both YouTube URL segment downloads (`download_ranges`) and local media file trimming require `ffmpeg.exe`. If `ffprobe.exe` is missing, YouTube Downloader Studio automatically falls back to `ffmpeg -hide_banner -i` to inspect duration and stream metadata.
+
+---
+
+## 6. Subtitles, `Captions Only` Mode, and Soft-Subtitle Embedding
+
+### Symptoms
+- "No manual subtitles or automatic captions are available" or "Requested subtitle track(s) could not be found".
+- Soft-subtitle embedding fails for an unsupported container.
+
+### Causes & Remedies
+- **Manual vs Auto-Generated Captions**: Many YouTube videos only provide speech-recognition captions (`[Auto]`) rather than creator-uploaded subtitles (`[Manual]`). Check the **Auto-Captions** box in the Captions/Subtitles row to include automatic captions.
+- **No FFmpeg Required for `Captions Only`**: Standalone **Captions Only** mode downloads and converts `.srt`, `.vtt`, and clean `.txt` transcripts in pure Python without downloading any video/audio streams and without requiring FFmpeg.
+- **Soft-Subtitle Container Support**: Soft-subtitle stream muxing (`Embed Soft Subtitles`) is supported for `MP4` (`mov_text`), `MKV` (`srt`), and `WebM` (`webvtt`) containers without re-encoding video or audio. Keep **Keep Subtitle File** checked if you also want the standalone `.srt`/`.vtt`/`.txt` file saved alongside the video.
+
+---
+
+## 7. Inspecting Application Logs
 
 Click **Open Logs** in the top-right header of the application window, or open the folder directly in Windows Explorer:
 

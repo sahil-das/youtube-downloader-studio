@@ -16,6 +16,7 @@ from src.core.exceptions import (
 )
 from src.core.models import MediaMetadata, PlaylistItemInfo
 from src.core.validators import validate_url
+from src.services.subtitle_service import extract_caption_tracks
 from src.utils.logging_config import get_logger
 
 logger = get_logger("media_info_service")
@@ -218,6 +219,7 @@ class MediaInfoService:
         uploader = str(info.get("uploader") or info.get("channel") or "Unknown Channel").strip()
         duration = self._safe_int(info.get("duration"))
         thumb = self._select_safe_thumbnail(info)
+        caption_tracks = extract_caption_tracks(info)
 
         return MediaMetadata(
             url=original_url,
@@ -236,6 +238,7 @@ class MediaInfoService:
             available_audio_exts=sorted(audio_exts),
             has_separate_streams=has_separate,
             has_muxed_streams=has_muxed or not has_separate,
+            caption_tracks=caption_tracks,
         )
 
     @staticmethod

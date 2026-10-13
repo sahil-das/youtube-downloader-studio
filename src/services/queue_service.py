@@ -23,12 +23,17 @@ from src.core.models import (
     JobStatus,
     OverwriteBehavior,
     PlaylistMode,
+    SourceType,
+    SubtitleFormat,
     VideoFormat,
     VideoQuality,
 )
 from src.core.validators import (
+    validate_local_media_path,
     validate_output_directory,
     validate_playlist_indices,
+    validate_subtitle_languages,
+    validate_trim_range,
     validate_url,
 )
 from src.database.repositories import HistoryRepository
@@ -121,12 +126,47 @@ class QueueService:
         overwrite_behavior: OverwriteBehavior = OverwriteBehavior.RENAME,
         playlist_mode: PlaylistMode = PlaylistMode.SINGLE,
         selected_playlist_indices: list[int] | None = None,
+        source_type: SourceType = SourceType.YOUTUBE_URL,
+        local_source_path: Path | str | None = None,
+        trim_enabled: bool = False,
+        trim_start_seconds: float | str = 0.0,
+        trim_end_seconds: float | str = 0.0,
+        trim_accurate: bool = True,
+        download_subtitles: bool = False,
+        include_auto_captions: bool = False,
+        subtitle_languages: list[str] | str | None = None,
+        subtitle_format: SubtitleFormat = SubtitleFormat.SRT,
+        txt_include_timestamps: bool = False,
+        embed_subtitles: bool = False,
+        keep_subtitle_files: bool = True,
         allow_duplicate: bool = False,
         start_immediately: bool | None = None,
     ) -> DownloadJob:
-        """Validate and add a new DownloadJob to the queue."""
-        normalized_url = validate_url(url)
+        """Validate and add a new DownloadJob (URL download, Captions-Only, or Local File Trim) to the queue."""
         resolved_dir = validate_output_directory(destination_dir, create_if_missing=True)
+
+        resolved_local_path: Path | None = None
+        if source_type == SourceType.LOCAL_FILE:
+            if mode == DownloadMode.CAPTIONS:
+                raise ValidationError(
+                    "Captions Only mode requires a YouTube URL rather than a local media file.",
+                    remedy="Switch the input source to YouTube URL to download captions.",
+                )
+            candidate_local = local_source_path or url
+            resolved_local_path = validate_local_media_path(candidate_local)
+            normalized_url = str(resolved_local_path)
+            trim_enabled = True
+        else:
+            normalized_url = validate_url(url)
+
+        start_sec = 0.0
+        end_sec = 0.0
+        if trim_enabled and mode != DownloadMode.CAPTIONS:
+            start_sec, end_sec = validate_trim_range(trim_start_seconds, trim_end_seconds)
+
+        validated_langs = ["en"]
+        if mode == DownloadMode.CAPTIONS or download_subtitles or embed_subtitles:
+            validated_langs = validate_subtitle_languages(subtitle_languages or ["en"])
 
         validated_indices: list[int] = []
         if playlist_mode == PlaylistMode.SELECTED_ITEMS:
@@ -149,11 +189,24 @@ class QueueService:
                 video_format=video_format,
                 audio_format=audio_format,
                 audio_quality=audio_quality,
-                title=title,
+                title=title or (resolved_local_path.name if resolved_local_path else ""),
                 filename_template=filename_template,
                 overwrite_behavior=overwrite_behavior,
                 playlist_mode=playlist_mode,
                 selected_playlist_indices=validated_indices,
+                source_type=source_type,
+                local_source_path=resolved_local_path,
+                trim_enabled=bool(trim_enabled and mode != DownloadMode.CAPTIONS),
+                trim_start_seconds=start_sec,
+                trim_end_seconds=end_sec,
+                trim_accurate=bool(trim_accurate),
+                download_subtitles=bool(download_subtitles or mode == DownloadMode.CAPTIONS),
+                include_auto_captions=bool(include_auto_captions),
+                subtitle_languages=validated_langs,
+                subtitle_format=subtitle_format,
+                txt_include_timestamps=bool(txt_include_timestamps),
+                embed_subtitles=bool(embed_subtitles and mode == DownloadMode.VIDEO),
+                keep_subtitle_files=bool(keep_subtitle_files),
             )
             self._jobs[job.job_id] = job
             self._job_order.append(job.job_id)
@@ -162,7 +215,7 @@ class QueueService:
             self._tracked_files[job.job_id] = []
             self._persist_job(job)
 
-        logger.info("Added job %s to queue (%s)", job.job_id, job.url)
+        logger.info("Added job %s to queue (%s, mode=%s)", job.job_id, job.url, job.mode.value)
         if self._event_bus is not None:
             self._event_bus.publish(EventType.JOB_ADDED, job_id=job.job_id, job=job)
             self._event_bus.publish(EventType.QUEUE_UPDATED)
@@ -172,6 +225,50 @@ class QueueService:
             self.start_queue()
 
         return job
+
+    def add_local_trim_job(
+        self,
+        local_file_path: Path | str | None = None,
+        destination_dir: Path | str = "",
+        start_time: float | str | None = None,
+        end_time: float | str | None = None,
+        mode: DownloadMode = DownloadMode.VIDEO,
+        video_format: VideoFormat = VideoFormat.MP4,
+        audio_format: AudioFormat = AudioFormat.MP3,
+        audio_quality: AudioQuality = AudioQuality.K192,
+        accurate_trim: bool = True,
+        overwrite_behavior: OverwriteBehavior = OverwriteBehavior.RENAME,
+        allow_duplicate: bool = True,
+        start_immediately: bool | None = None,
+        *,
+        local_source_path: Path | str | None = None,
+        trim_start_seconds: float | str | None = None,
+        trim_end_seconds: float | str | None = None,
+        trim_accurate: bool | None = None,
+    ) -> DownloadJob:
+        """Convenience helper to validate and queue a local video or audio trimming job."""
+        resolved_source = local_file_path if local_file_path is not None else local_source_path
+        resolved_start = start_time if start_time is not None else (trim_start_seconds if trim_start_seconds is not None else 0.0)
+        resolved_end = end_time if end_time is not None else (trim_end_seconds if trim_end_seconds is not None else 0.0)
+        resolved_accurate = trim_accurate if trim_accurate is not None else accurate_trim
+
+        return self.add_job(
+            url=str(resolved_source or ""),
+            destination_dir=destination_dir,
+            mode=mode,
+            video_format=video_format,
+            audio_format=audio_format,
+            audio_quality=audio_quality,
+            overwrite_behavior=overwrite_behavior,
+            source_type=SourceType.LOCAL_FILE,
+            local_source_path=resolved_source,
+            trim_enabled=True,
+            trim_start_seconds=resolved_start,
+            trim_end_seconds=resolved_end,
+            trim_accurate=resolved_accurate,
+            allow_duplicate=allow_duplicate,
+            start_immediately=start_immediately,
+        )
 
     def add_batch_jobs(
         self,
@@ -185,6 +282,17 @@ class QueueService:
         filename_template: str = "%(title).150B [%(id)s].%(ext)s",
         overwrite_behavior: OverwriteBehavior = OverwriteBehavior.RENAME,
         playlist_mode: PlaylistMode = PlaylistMode.SINGLE,
+        trim_enabled: bool = False,
+        trim_start_seconds: float | str = 0.0,
+        trim_end_seconds: float | str = 0.0,
+        trim_accurate: bool = True,
+        download_subtitles: bool = False,
+        include_auto_captions: bool = False,
+        subtitle_languages: list[str] | str | None = None,
+        subtitle_format: SubtitleFormat = SubtitleFormat.SRT,
+        txt_include_timestamps: bool = False,
+        embed_subtitles: bool = False,
+        keep_subtitle_files: bool = True,
         allow_duplicate: bool = False,
         start_immediately: bool | None = None,
     ) -> tuple[list[DownloadJob], list[str]]:
@@ -209,6 +317,17 @@ class QueueService:
                     filename_template=filename_template,
                     overwrite_behavior=overwrite_behavior,
                     playlist_mode=playlist_mode,
+                    trim_enabled=trim_enabled,
+                    trim_start_seconds=trim_start_seconds,
+                    trim_end_seconds=trim_end_seconds,
+                    trim_accurate=trim_accurate,
+                    download_subtitles=download_subtitles,
+                    include_auto_captions=include_auto_captions,
+                    subtitle_languages=subtitle_languages,
+                    subtitle_format=subtitle_format,
+                    txt_include_timestamps=txt_include_timestamps,
+                    embed_subtitles=embed_subtitles,
+                    keep_subtitle_files=keep_subtitle_files,
                     allow_duplicate=allow_duplicate,
                     start_immediately=False,
                 )

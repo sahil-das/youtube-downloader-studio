@@ -33,6 +33,8 @@ def test_cli_entry_points_check_env_and_smoke_test_ui(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    import sys
+
     isolated_dir = tmp_path / "cli_isolated_data"
     rc_env = app_main(["--check-env", "--data-dir", str(isolated_dir)])
     assert rc_env == 0
@@ -41,8 +43,16 @@ def test_cli_entry_points_check_env_and_smoke_test_ui(
     assert "yt-dlp" in captured_env.out
     assert (isolated_dir / "logs" / "app.log").exists()
 
-    rc_ui = app_main(["--smoke-test-ui", "--data-dir", str(isolated_dir)])
-    assert rc_ui == 0
+    root = get_bundle_dir()
+    res_ui = subprocess.run(
+        [sys.executable, str(root / "run.py"), "--smoke-test-ui", "--data-dir", str(isolated_dir)],
+        cwd=str(root),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert res_ui.returncode == 0, f"STDERR: {res_ui.stderr}\nSTDOUT: {res_ui.stdout}"
     assert (isolated_dir / "history.db").exists()
     assert (isolated_dir / "logs" / "app.log").exists()
 

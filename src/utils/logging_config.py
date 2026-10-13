@@ -64,6 +64,24 @@ def parse_log_level(level_name: str) -> int:
     return mapping.get(str(level_name).strip().upper(), logging.INFO)
 
 
+class _SafeStderrHandler(logging.StreamHandler):  # type: ignore[type-arg]
+    """StreamHandler that dynamically resolves sys.stderr so pytest capsys closures never fail."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        import sys
+
+        stream = sys.stderr
+        if stream is None or getattr(stream, "closed", False):
+            stream = getattr(sys, "__stderr__", None)
+        if stream is None or getattr(stream, "closed", False):
+            return
+        self.stream = stream
+        try:
+            super().emit(record)
+        except ValueError:
+            pass
+
+
 def setup_logging(log_dir: Path, level: str = "INFO") -> Path:
     """Configure application logging with rotating file handler and console output."""
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -98,7 +116,7 @@ def setup_logging(log_dir: Path, level: str = "INFO") -> Path:
     file_handler.addFilter(sensitive_filter)
     root_logger.addHandler(file_handler)
 
-    console_handler = logging.StreamHandler()
+    console_handler = _SafeStderrHandler()
     console_handler.setLevel(numeric_level)
     console_handler.setFormatter(formatter)
     console_handler.addFilter(sensitive_filter)

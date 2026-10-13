@@ -13,6 +13,7 @@ from src.core.models import (
     AudioQuality,
     DownloadMode,
     OverwriteBehavior,
+    SubtitleFormat,
     ThemeMode,
     VideoFormat,
     VideoQuality,
@@ -57,6 +58,10 @@ class SettingsService:
             default_video_format=VideoFormat.MP4,
             default_audio_format=AudioFormat.MP3,
             default_audio_quality=AudioQuality.K192,
+            default_subtitle_format=SubtitleFormat.SRT,
+            default_include_auto_captions=False,
+            default_embed_subtitles=False,
+            default_keep_subtitle_files=True,
             theme_mode=ThemeMode.DARK,
             max_concurrent_downloads=2,
             filename_template="%(title).150B [%(id)s].%(ext)s",
@@ -150,6 +155,21 @@ class SettingsService:
             audio_quality = defaults.default_audio_quality
 
         try:
+            subtitle_format = SubtitleFormat(
+                str(data.get("default_subtitle_format", defaults.default_subtitle_format.value))
+            )
+        except ValueError:
+            subtitle_format = defaults.default_subtitle_format
+
+        include_auto_captions = bool(
+            data.get("default_include_auto_captions", defaults.default_include_auto_captions)
+        )
+        embed_subtitles = bool(data.get("default_embed_subtitles", defaults.default_embed_subtitles))
+        keep_subtitle_files = bool(
+            data.get("default_keep_subtitle_files", defaults.default_keep_subtitle_files)
+        )
+
+        try:
             theme_mode = ThemeMode(str(data.get("theme_mode", defaults.theme_mode.value)))
         except ValueError:
             theme_mode = defaults.theme_mode
@@ -193,6 +213,10 @@ class SettingsService:
             default_video_format=video_format,
             default_audio_format=audio_format,
             default_audio_quality=audio_quality,
+            default_subtitle_format=subtitle_format,
+            default_include_auto_captions=include_auto_captions,
+            default_embed_subtitles=embed_subtitles,
+            default_keep_subtitle_files=keep_subtitle_files,
             theme_mode=theme_mode,
             max_concurrent_downloads=concurrency,
             filename_template=template,
@@ -251,6 +275,10 @@ class SettingsService:
             default_video_format=VideoFormat(candidate.default_video_format),
             default_audio_format=AudioFormat(candidate.default_audio_format),
             default_audio_quality=AudioQuality(candidate.default_audio_quality),
+            default_subtitle_format=SubtitleFormat(candidate.default_subtitle_format),
+            default_include_auto_captions=bool(candidate.default_include_auto_captions),
+            default_embed_subtitles=bool(candidate.default_embed_subtitles),
+            default_keep_subtitle_files=bool(candidate.default_keep_subtitle_files),
             theme_mode=ThemeMode(candidate.theme_mode),
             max_concurrent_downloads=concurrency,
             filename_template=cleaned_template,

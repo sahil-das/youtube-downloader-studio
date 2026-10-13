@@ -110,9 +110,10 @@ class QueueItemCard(ctk.CTkFrame):
         if job.playlist_index and job.playlist_total:
             pl_prefix = f"[Item {job.playlist_index}/{job.playlist_total}] "
 
+        src_label = str(job.local_source_path) if job.local_source_path else job.url
         self._title_lbl.configure(text=f"{pl_prefix}{job.display_title}")
         self._subtitle_lbl.configure(
-            text=f"{job.requested_format_summary}  •  {job.url}  •  Dest: {job.destination_dir}"
+            text=f"{job.requested_format_summary}  •  {src_label}  •  Dest: {job.destination_dir}"
         )
 
         badge_text = STATUS_LABELS.get(job.status, job.status.value.title())
@@ -122,15 +123,28 @@ class QueueItemCard(ctk.CTkFrame):
         pct = max(0.0, min(100.0, float(job.progress_percent or 0.0)))
         self._progress_bar.set(pct / 100.0)
 
-        if job.status == JobStatus.DOWNLOADING:
-            dl_str = format_bytes(job.downloaded_bytes)
-            tot_str = format_bytes(job.total_bytes) if job.total_bytes else "Unknown size"
-            spd_str = format_speed(job.speed_bps)
-            eta_str = format_eta(job.eta_seconds)
+        if job.status == JobStatus.FETCHING_METADATA:
+            stage_txt = job.stage_detail or "Retrieving media metadata..."
             self._metrics_lbl.configure(
-                text=f"{pct:.1f}%  ({dl_str} / {tot_str})   •   Speed: {spd_str}   •   ETA: {eta_str}",
+                text=stage_txt,
                 text_color=("gray25", "gray80"),
             )
+        elif job.status == JobStatus.DOWNLOADING:
+            if job.stage_detail and job.total_bytes == 0:
+                self._metrics_lbl.configure(
+                    text=f"{pct:.1f}%   •   {job.stage_detail}",
+                    text_color=("gray25", "gray80"),
+                )
+            else:
+                dl_str = format_bytes(job.downloaded_bytes)
+                tot_str = format_bytes(job.total_bytes) if job.total_bytes else "Unknown size"
+                spd_str = format_speed(job.speed_bps)
+                eta_str = format_eta(job.eta_seconds)
+                stage_prefix = f"{job.stage_detail}  •  " if job.stage_detail else ""
+                self._metrics_lbl.configure(
+                    text=f"{stage_prefix}{pct:.1f}%  ({dl_str} / {tot_str})   •   Speed: {spd_str}   •   ETA: {eta_str}",
+                    text_color=("gray25", "gray80"),
+                )
         elif job.status == JobStatus.PAUSED:
             dl_str = format_bytes(job.downloaded_bytes)
             self._metrics_lbl.configure(
@@ -138,15 +152,22 @@ class QueueItemCard(ctk.CTkFrame):
                 text_color=("#b45309", "#fbbf24"),
             )
         elif job.status == JobStatus.PROCESSING:
+            stage_txt = (
+                job.stage_detail
+                or "100% downloaded — running FFmpeg stream merge / audio conversion..."
+            )
             self._metrics_lbl.configure(
-                text="100% downloaded — running FFmpeg stream merge / audio conversion...",
+                text=stage_txt,
                 text_color=("#6d28d9", "#c4b5fd"),
             )
         elif job.status == JobStatus.COMPLETED:
             size_str = format_bytes(job.file_size_bytes)
             out_name = job.output_path.name if job.output_path else "Saved"
+            extra_subs = ""
+            if len(job.exported_subtitle_paths) > 1:
+                extra_subs = f" (+{len(job.exported_subtitle_paths) - 1} subtitle file(s))"
             self._metrics_lbl.configure(
-                text=f"Completed ({size_str})  •  {out_name}",
+                text=f"Completed ({size_str})  •  {out_name}{extra_subs}",
                 text_color=("#15803d", "#4ade80"),
             )
         elif job.status == JobStatus.FAILED:
@@ -162,7 +183,7 @@ class QueueItemCard(ctk.CTkFrame):
             )
         else:
             self._metrics_lbl.configure(
-                text="Waiting in queue...",
+                text=job.stage_detail or "Waiting in queue...",
                 text_color=("gray40", "gray65"),
             )
 

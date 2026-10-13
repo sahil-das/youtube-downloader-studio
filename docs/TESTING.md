@@ -64,11 +64,41 @@ $env:YDS_TEST_FAIL_URL = "https://www.youtube.com/watch?v=invalid_id_000"
    - Cooperative pause and resume (`Active -> Paused -> Queued -> Active -> Completed`), `.part` file preservation on pause vs cleanup on cancel, progress retention across resume, late progress event suppression, and unfinished job recovery across application restarts.
 9. **`tests/test_cancellation.py`**:
    - Cancelling queued, metadata-fetching, downloading, playlist, and post-processing jobs; `.part`/`.part-Frag*`/`.ytdl` cleanup while preserving completed media files; and retrying cancelled jobs.
-10. **`tests/test_ui_logic.py`**:
-    - UI formatters, status badges, and full `MainWindow` workflow testing (tab navigation, Video/Audio mode switching, FFmpeg-missing option filtering, URL validation dialogs, queue Pause/Resume/Cancel/Retry, History search/filter, Settings save/reset, Dark/Light theme toggle, and clean shutdown).
-11. **`tests/test_packaging.py`**:
+10. **`tests/test_trimming.py`**:
+    - Timestamp parsing and formatting across `SS`, `MM:SS`, and `HH:MM:SS(.mmm)`.
+    - Trim range validation (positive durations, bounds checking against media duration, inverted timestamp rejection).
+    - Local media path validation (file existence, extension whitelisting, non-empty size).
+    - YouTube URL segment download via `yt-dlp` `download_ranges` and output duration verification.
+    - Local media file trimming (fast stream copy and frame-accurate re-encode) preserving the original file untouched.
+    - Video-only, audio-only, and video+audio stream handling.
+    - Cooperative cancellation cleanup of partial trimmed files.
+    - Automatic `ffmpeg -hide_banner -i` stderr probing fallback when `ffprobe` is missing.
+    - Real FFmpeg local probe and segment trimming integration test.
+11. **`tests/test_subtitles.py`**:
+    - Subtitle track extraction distinguishing manual uploaded subtitles (`[Manual]`) from YouTube auto-generated captions (`[Auto]`).
+    - Human-readable language resolution with regional variants and language code fallback.
+    - Structured subtitle cue parsing for WebVTT (`.vtt`), SubRip (`.srt`), YouTube JSON3 (`.json3`), and timed-text XML (`.srv3`/`.ttml`).
+    - VTT <-> SRT lossless round-trip conversion.
+    - Clean TXT transcript export (stripping tags, cue numbers, and rolling auto-caption duplicate lines) with optional `[MM:SS]` timestamps.
+    - Multi-language batch download and naming (`<stem>.<lang>.srt` vs `<stem>.<lang>.auto.srt`).
+    - Standalone **Captions Only** mode guarantees: zero video/audio downloads, zero media files created, never calls FFmpeg, and succeeds even when FFmpeg is absent.
+    - Queue execution, progress stages (`Retrieving video metadata` -> `Discovering caption tracks` -> `Downloading selected caption tracks` -> `Converting caption formats` -> `Verifying subtitle output files` -> `Completed`), and cancellation cleanup.
+    - Soft-subtitle muxing command generation (`-c:s mov_text` for MP4, `-c:s srt` for MKV, `-c:s webvtt` for WebM) copying audio/video streams without re-encoding.
+    - Keeping vs removing sidecar subtitle files alongside video downloads.
+    - Real FFmpeg soft-subtitle muxing and stream verification integration test.
+12. **`tests/test_ui_logic.py`**:
+    - UI formatters, status badges, and full `MainWindow` workflow testing:
+      - Tab navigation (`Downloader & Queue`, `Download History`, `Settings`).
+      - Three download modes (`Video`, `Audio Only`, `Captions Only`).
+      - FFmpeg-missing option filtering (restricting audio formats, allowing Captions Only mode).
+      - URL validation dialogs and batch submission.
+      - `TrimTimelineWidget` two-way synchronization: duration setting, timestamp entry parsing, clip duration calculation, handle dragging, and boundary clamping.
+      - `Captions Only` UI controls: track menu population from discovered tracks, language selection, and FFmpeg-free queuing.
+      - `Local Media File` source mode: file browsing/inspection, timeline duration synchronization, and local trim job submission.
+      - Queue Pause/Resume/Cancel/Retry, History search/filter, Settings save/reset, Dark/Light theme toggle, and clean shutdown.
+13. **`tests/test_packaging.py`**:
     - Verification of `dist\YouTubeDownloaderStudio\YouTubeDownloaderStudio.exe`, bundled assets (`customtkinter`, `yt_dlp_ejs`, `app_icon.ico`), and isolated execution with `--check-env` and `--smoke-test-ui --data-dir`.
-12. **`tests/integration/test_live_downloads.py`**:
+14. **`tests/integration/test_live_downloads.py`**:
     - Opt-in live download tests for metadata, video, audio/MP3, playlists, failure recovery, pause/resume, and cancellation.
 
 ---

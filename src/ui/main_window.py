@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog
 
@@ -14,27 +15,35 @@ from src.core.models import (
     AppSettings,
     AudioFormat,
     AudioQuality,
+    CaptionSource,
     DependencyStatus,
     DownloadMode,
     HistoryEntry,
     JobStatus,
+    LocalMediaInfo,
     MediaMetadata,
     PlaylistMode,
+    SourceType,
+    SubtitleFormat,
     ThemeMode,
     VideoFormat,
     VideoQuality,
 )
 from src.core.validators import (
+    SUPPORTED_LOCAL_MEDIA_EXTENSIONS,
     is_likely_playlist_url,
     parse_batch_urls,
+    validate_local_media_path,
     validate_output_directory,
+    validate_subtitle_languages,
+    validate_trim_range,
 )
 from src.database.repositories import HistoryRepository
 from src.services.ffmpeg_service import FFmpegService
 from src.services.media_info_service import MediaInfoService
 from src.services.queue_service import QueueService
 from src.services.settings_service import SettingsService
-from src.ui.components import MetadataPreviewCard
+from src.ui.components import MetadataPreviewCard, TrimTimelineWidget
 from src.ui.dialogs import (
     DiagnosticsDialog,
     PlaylistSelectionDialog,
@@ -79,15 +88,17 @@ class MainWindow(ctk.CTk):
 
         self._metadata_cancel_event: threading.Event | None = None
         self._current_metadata: MediaMetadata | None = None
+        self._current_local_media: LocalMediaInfo | None = None
         self._selected_playlist_mode: PlaylistMode = PlaylistMode.SINGLE
         self._selected_playlist_indices: list[int] = []
+        self._caption_label_to_code: dict[str, str] = {}
 
         # Apply saved theme
         self._apply_theme(self._settings_service.settings.theme_mode)
 
         self.title("YouTube Downloader Studio")
-        self.geometry("1160x800")
-        self.minsize(1020, 700)
+        self.geometry("1180x860")
+        self.minsize(1040, 740)
 
         if icon_path and icon_path.exists():
             try:
@@ -143,7 +154,7 @@ class MainWindow(ctk.CTk):
 
         ctk.CTkLabel(
             title_block,
-            text="Authorized Video, Audio & Playlist Desktop Manager",
+            text="Authorized Video, Audio, Trimming, Captions & Playlist Desktop Manager",
             font=ctk.CTkFont(size=11),
             text_color=("gray35", "gray70"),
             anchor="w",
@@ -184,7 +195,7 @@ class MainWindow(ctk.CTk):
 
     def _build_navigation(self) -> None:
         nav_frame = ctk.CTkFrame(self, fg_color="transparent")
-        nav_frame.grid(row=1, column=0, sticky="ew", padx=16, pady=(8, 4))
+        nav_frame.grid(row=1, column=0, sticky="ew", padx=16, pady=(6, 4))
         nav_frame.grid_columnconfigure(0, weight=1)
 
         self._nav_segmented = ctk.CTkSegmentedButton(
@@ -239,31 +250,53 @@ class MainWindow(ctk.CTk):
 
         top_bar = ctk.CTkFrame(box, fg_color="transparent")
         top_bar.grid(row=0, column=0, columnspan=2, sticky="ew", padx=12, pady=(8, 2))
-        top_bar.grid_columnconfigure(0, weight=1)
+        top_bar.grid_columnconfigure(1, weight=1)
+
+        source_wrap = ctk.CTkFrame(top_bar, fg_color="transparent")
+        source_wrap.grid(row=0, column=0, sticky="w", padx=(0, 12))
 
         ctk.CTkLabel(
-            top_bar,
-            text="YouTube Video or Playlist URL(s) — paste one URL or multiple URLs (one per line):",
+            source_wrap,
+            text="Input Source:",
             font=ctk.CTkFont(size=12, weight="bold"),
-            anchor="w",
-        ).grid(row=0, column=0, sticky="w")
+        ).pack(side="left", padx=(0, 6))
 
-        btn_strip = ctk.CTkFrame(top_bar, fg_color="transparent")
-        btn_strip.grid(row=0, column=1, sticky="e")
+        self._source_selector = ctk.CTkSegmentedButton(
+            source_wrap,
+            values=["YouTube URL", "Local Media File"],
+            width=220,
+            height=26,
+            command=self._on_source_type_changed,
+        )
+        self._source_selector.set("YouTube URL")
+        self._source_selector.pack(side="left")
+
+        self._input_prompt_lbl = ctk.CTkLabel(
+            top_bar,
+            text="Paste one or more YouTube video/playlist URLs (one per line):",
+            font=ctk.CTkFont(size=11),
+            text_color=("gray35", "gray70"),
+            anchor="w",
+        )
+        self._input_prompt_lbl.grid(row=0, column=1, sticky="w")
+
+        # URL action strip
+        self._url_btn_strip = ctk.CTkFrame(top_bar, fg_color="transparent")
+        self._url_btn_strip.grid(row=0, column=2, sticky="e")
 
         ctk.CTkButton(
-            btn_strip,
+            self._url_btn_strip,
             text="Paste Clipboard",
-            width=120,
+            width=116,
             height=26,
             font=ctk.CTkFont(size=11),
             command=self._paste_from_clipboard,
         ).pack(side="left", padx=(0, 6))
 
         ctk.CTkButton(
-            btn_strip,
+            self._url_btn_strip,
             text="Clear",
-            width=68,
+            width=64,
             height=26,
             font=ctk.CTkFont(size=11),
             fg_color=("gray75", "gray30"),
@@ -272,22 +305,63 @@ class MainWindow(ctk.CTk):
         ).pack(side="left", padx=(0, 6))
 
         self._fetch_info_btn = ctk.CTkButton(
-            btn_strip,
+            self._url_btn_strip,
             text="Fetch Info / Preview",
-            width=142,
+            width=140,
             height=26,
             font=ctk.CTkFont(size=11, weight="bold"),
             command=self._start_metadata_fetch,
         )
         self._fetch_info_btn.pack(side="left")
 
+        # Local file action strip
+        self._local_btn_strip = ctk.CTkFrame(top_bar, fg_color="transparent")
+
+        ctk.CTkButton(
+            self._local_btn_strip,
+            text="Browse Local File...",
+            width=136,
+            height=26,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=self._browse_local_media_file,
+        ).pack(side="left", padx=(0, 6))
+
+        ctk.CTkButton(
+            self._local_btn_strip,
+            text="Inspect File",
+            width=96,
+            height=26,
+            font=ctk.CTkFont(size=11),
+            command=self._inspect_local_media_file,
+        ).pack(side="left", padx=(0, 6))
+
+        ctk.CTkButton(
+            self._local_btn_strip,
+            text="Clear",
+            width=64,
+            height=26,
+            font=ctk.CTkFont(size=11),
+            fg_color=("gray75", "gray30"),
+            text_color=("gray10", "gray90"),
+            command=self._clear_local_input,
+        ).pack(side="left")
+
+        # URL textbox
         self._url_textbox = ctk.CTkTextbox(
             box,
-            height=56,
+            height=50,
             font=ctk.CTkFont(family="Consolas", size=12),
             wrap="none",
         )
         self._url_textbox.grid(row=1, column=0, sticky="ew", padx=12, pady=(2, 8))
+
+        # Local file entry
+        self._local_path_entry = ctk.CTkEntry(
+            box,
+            height=34,
+            placeholder_text="Select a local video or audio file (.mp4, .mkv, .webm, .mov, .mp3, .m4a, .wav, .flac, .opus)...",
+            font=ctk.CTkFont(family="Consolas", size=12),
+        )
 
     def _build_metadata_section(self, parent: ctk.CTkFrame) -> None:
         self._preview_card = MetadataPreviewCard(
@@ -300,27 +374,27 @@ class MainWindow(ctk.CTk):
     def _build_options_section(self, parent: ctk.CTkFrame) -> None:
         opts_card = ctk.CTkFrame(parent, corner_radius=8)
         opts_card.grid(row=2, column=0, sticky="ew", pady=(0, 6))
-        opts_card.grid_columnconfigure(3, weight=1)
+        opts_card.grid_columnconfigure(0, weight=1)
 
         # Row 0: Mode, Quality/Format, Playlist Mode
         row0 = ctk.CTkFrame(opts_card, fg_color="transparent")
-        row0.grid(row=0, column=0, columnspan=4, sticky="ew", padx=12, pady=(8, 4))
+        row0.grid(row=0, column=0, sticky="ew", padx=12, pady=(8, 4))
 
         ctk.CTkLabel(row0, text="Mode:", font=ctk.CTkFont(size=12, weight="bold")).pack(
             side="left", padx=(0, 6)
         )
         self._mode_selector = ctk.CTkSegmentedButton(
             row0,
-            values=["Video", "Audio Only"],
-            width=170,
+            values=["Video", "Audio Only", "Captions Only"],
+            width=285,
             command=self._on_mode_changed,
         )
         self._mode_selector.set("Video")
-        self._mode_selector.pack(side="left", padx=(0, 16))
+        self._mode_selector.pack(side="left", padx=(0, 14))
 
         # Video options frame
         self._video_opts_frame = ctk.CTkFrame(row0, fg_color="transparent")
-        self._video_opts_frame.pack(side="left", padx=(0, 14))
+        self._video_opts_frame.pack(side="left", padx=(0, 12))
 
         ctk.CTkLabel(self._video_opts_frame, text="Quality:", font=ctk.CTkFont(size=12)).pack(
             side="left", padx=(0, 6)
@@ -328,10 +402,10 @@ class MainWindow(ctk.CTk):
         self._video_quality_menu = ctk.CTkOptionMenu(
             self._video_opts_frame,
             values=[q.value for q in VideoQuality],
-            width=115,
+            width=110,
         )
         self._video_quality_menu.set(VideoQuality.Q1080P.value)
-        self._video_quality_menu.pack(side="left", padx=(0, 12))
+        self._video_quality_menu.pack(side="left", padx=(0, 10))
 
         ctk.CTkLabel(self._video_opts_frame, text="Format:", font=ctk.CTkFont(size=12)).pack(
             side="left", padx=(0, 6)
@@ -339,7 +413,7 @@ class MainWindow(ctk.CTk):
         self._video_format_menu = ctk.CTkOptionMenu(
             self._video_opts_frame,
             values=[f.value for f in VideoFormat],
-            width=95,
+            width=90,
         )
         self._video_format_menu.set(VideoFormat.MP4.value)
         self._video_format_menu.pack(side="left")
@@ -353,10 +427,10 @@ class MainWindow(ctk.CTk):
         self._audio_format_menu = ctk.CTkOptionMenu(
             self._audio_opts_frame,
             values=[a.value for a in AudioFormat],
-            width=115,
+            width=110,
         )
         self._audio_format_menu.set(AudioFormat.MP3.value)
-        self._audio_format_menu.pack(side="left", padx=(0, 12))
+        self._audio_format_menu.pack(side="left", padx=(0, 10))
 
         ctk.CTkLabel(self._audio_opts_frame, text="Bitrate (kbps):", font=ctk.CTkFont(size=12)).pack(
             side="left", padx=(0, 6)
@@ -364,41 +438,178 @@ class MainWindow(ctk.CTk):
         self._audio_quality_menu = ctk.CTkOptionMenu(
             self._audio_opts_frame,
             values=[q.value for q in AudioQuality],
-            width=95,
+            width=90,
         )
         self._audio_quality_menu.set(AudioQuality.K192.value)
         self._audio_quality_menu.pack(side="left")
 
-        # Playlist option
-        pl_frame = ctk.CTkFrame(row0, fg_color="transparent")
-        pl_frame.pack(side="right")
+        # Captions Only badge in row0
+        self._captions_mode_badge = ctk.CTkLabel(
+            row0,
+            text="No video or audio streams will be downloaded • Works without FFmpeg",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=("#1d4ed8", "#60a5fa"),
+        )
 
-        ctk.CTkLabel(pl_frame, text="Playlist Handling:", font=ctk.CTkFont(size=12)).pack(
+        # Playlist option
+        self._pl_frame = ctk.CTkFrame(row0, fg_color="transparent")
+        self._pl_frame.pack(side="right")
+
+        ctk.CTkLabel(self._pl_frame, text="Playlist:", font=ctk.CTkFont(size=12)).pack(
             side="left", padx=(0, 6)
         )
         self._playlist_mode_menu = ctk.CTkOptionMenu(
-            pl_frame,
+            self._pl_frame,
             values=["Single Video Only", "Full Playlist", "Selected Items"],
-            width=150,
+            width=145,
             command=self._on_playlist_menu_changed,
         )
         self._playlist_mode_menu.set("Single Video Only")
         self._playlist_mode_menu.pack(side="left")
 
-        # Row 1: Destination folder + Add to Queue / Start Download buttons
-        row1 = ctk.CTkFrame(opts_card, fg_color="transparent")
-        row1.grid(row=1, column=0, columnspan=4, sticky="ew", padx=12, pady=(4, 10))
-        row1.grid_columnconfigure(1, weight=1)
+        # Row 1: Captions & Subtitles Controls (shown in Video mode and Captions Only mode)
+        self._captions_row = ctk.CTkFrame(
+            opts_card,
+            corner_radius=6,
+            border_width=1,
+            border_color=("gray80", "gray28"),
+        )
+        self._captions_row.grid(row=1, column=0, sticky="ew", padx=12, pady=(2, 4))
 
-        ctk.CTkLabel(row1, text="Save To:", font=ctk.CTkFont(size=12, weight="bold")).grid(
+        cap_inner = ctk.CTkFrame(self._captions_row, fg_color="transparent")
+        cap_inner.pack(fill="x", padx=10, pady=6)
+
+        ctk.CTkLabel(
+            cap_inner,
+            text="Captions / Subtitles:",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        ).pack(side="left", padx=(0, 8))
+
+        # Video-mode subtitle checkboxes (hidden in Captions Only mode)
+        self._video_sub_opts_frame = ctk.CTkFrame(cap_inner, fg_color="transparent")
+        self._video_sub_opts_frame.pack(side="left", padx=(0, 8))
+
+        self._download_subs_var = tk.BooleanVar(value=False)
+        self._download_subs_cb = ctk.CTkCheckBox(
+            self._video_sub_opts_frame,
+            text="Save Subtitles",
+            variable=self._download_subs_var,
+            width=110,
+            checkbox_width=18,
+            checkbox_height=18,
+            font=ctk.CTkFont(size=11),
+        )
+        self._download_subs_cb.pack(side="left", padx=(0, 8))
+
+        self._embed_subs_var = tk.BooleanVar(value=False)
+        self._embed_subs_cb = ctk.CTkCheckBox(
+            self._video_sub_opts_frame,
+            text="Embed Soft Subtitles",
+            variable=self._embed_subs_var,
+            width=140,
+            checkbox_width=18,
+            checkbox_height=18,
+            font=ctk.CTkFont(size=11),
+            command=self._on_embed_subs_toggled,
+        )
+        self._embed_subs_cb.pack(side="left", padx=(0, 8))
+
+        self._keep_sub_files_var = tk.BooleanVar(value=True)
+        self._keep_sub_files_cb = ctk.CTkCheckBox(
+            self._video_sub_opts_frame,
+            text="Keep Subtitle File",
+            variable=self._keep_sub_files_var,
+            width=125,
+            checkbox_width=18,
+            checkbox_height=18,
+            font=ctk.CTkFont(size=11),
+        )
+        self._keep_sub_files_cb.pack(side="left")
+
+        # Shared caption track / language / format controls
+        ctk.CTkLabel(cap_inner, text="Track:", font=ctk.CTkFont(size=11)).pack(
+            side="left", padx=(4, 4)
+        )
+        self._caption_track_menu = ctk.CTkOptionMenu(
+            cap_inner,
+            values=["English (en)"],
+            width=175,
+            height=26,
+            font=ctk.CTkFont(size=11),
+            command=self._on_caption_track_selected,
+        )
+        self._caption_track_menu.set("English (en)")
+        self._caption_track_menu.pack(side="left", padx=(0, 8))
+
+        ctk.CTkLabel(cap_inner, text="Langs:", font=ctk.CTkFont(size=11)).pack(
+            side="left", padx=(0, 4)
+        )
+        self._subtitle_langs_entry = ctk.CTkEntry(
+            cap_inner,
+            width=90,
+            height=26,
+            font=ctk.CTkFont(family="Consolas", size=11),
+            placeholder_text="en, es",
+        )
+        self._subtitle_langs_entry.insert(0, "en")
+        self._subtitle_langs_entry.pack(side="left", padx=(0, 8))
+
+        self._include_auto_captions_var = tk.BooleanVar(value=True)
+        self._include_auto_captions_cb = ctk.CTkCheckBox(
+            cap_inner,
+            text="Auto-Captions",
+            variable=self._include_auto_captions_var,
+            width=105,
+            checkbox_width=18,
+            checkbox_height=18,
+            font=ctk.CTkFont(size=11),
+            command=self._on_auto_captions_filter_changed,
+        )
+        self._include_auto_captions_cb.pack(side="left", padx=(0, 8))
+
+        ctk.CTkLabel(cap_inner, text="Export:", font=ctk.CTkFont(size=11)).pack(
+            side="left", padx=(0, 4)
+        )
+        self._subtitle_format_menu = ctk.CTkOptionMenu(
+            cap_inner,
+            values=[f.value for f in SubtitleFormat],
+            width=76,
+            height=26,
+            font=ctk.CTkFont(size=11),
+        )
+        self._subtitle_format_menu.set(SubtitleFormat.SRT.value)
+        self._subtitle_format_menu.pack(side="left", padx=(0, 8))
+
+        self._txt_timestamps_var = tk.BooleanVar(value=False)
+        self._txt_timestamps_cb = ctk.CTkCheckBox(
+            cap_inner,
+            text="TXT Timestamps",
+            variable=self._txt_timestamps_var,
+            width=115,
+            checkbox_width=18,
+            checkbox_height=18,
+            font=ctk.CTkFont(size=11),
+        )
+        self._txt_timestamps_cb.pack(side="left")
+
+        # Row 2: Synchronized Interactive Trim Timeline (shown in Video & Audio Only modes)
+        self._trim_timeline = TrimTimelineWidget(opts_card)
+        self._trim_timeline.grid(row=2, column=0, sticky="ew", padx=12, pady=(2, 4))
+
+        # Row 3: Destination folder + Add to Queue / Start Download buttons
+        row3 = ctk.CTkFrame(opts_card, fg_color="transparent")
+        row3.grid(row=3, column=0, sticky="ew", padx=12, pady=(4, 10))
+        row3.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(row3, text="Save To:", font=ctk.CTkFont(size=12, weight="bold")).grid(
             row=0, column=0, padx=(0, 8), sticky="w"
         )
 
-        self._dest_entry = ctk.CTkEntry(row1, height=32)
+        self._dest_entry = ctk.CTkEntry(row3, height=32)
         self._dest_entry.grid(row=0, column=1, sticky="ew", padx=(0, 6))
 
         ctk.CTkButton(
-            row1,
+            row3,
             text="Browse...",
             width=86,
             height=32,
@@ -408,7 +619,7 @@ class MainWindow(ctk.CTk):
         ).grid(row=0, column=2, padx=(0, 6))
 
         ctk.CTkButton(
-            row1,
+            row3,
             text="Open Folder",
             width=96,
             height=32,
@@ -417,17 +628,18 @@ class MainWindow(ctk.CTk):
             command=self._open_destination_folder,
         ).grid(row=0, column=3, padx=(0, 16))
 
-        ctk.CTkButton(
-            row1,
+        self._add_queue_btn = ctk.CTkButton(
+            row3,
             text="+ Add to Queue",
             width=132,
             height=34,
             font=ctk.CTkFont(size=12, weight="bold"),
             command=lambda: self._submit_urls(start_immediately=False),
-        ).grid(row=0, column=4, padx=(0, 8))
+        )
+        self._add_queue_btn.grid(row=0, column=4, padx=(0, 8))
 
-        ctk.CTkButton(
-            row1,
+        self._download_now_btn = ctk.CTkButton(
+            row3,
             text="▶ Download Now",
             width=148,
             height=34,
@@ -435,7 +647,8 @@ class MainWindow(ctk.CTk):
             fg_color=("#16a34a", "#15803d"),
             hover_color=("#15803d", "#166534"),
             command=lambda: self._submit_urls(start_immediately=True),
-        ).grid(row=0, column=5)
+        )
+        self._download_now_btn.grid(row=0, column=5)
 
     def _build_footer(self) -> None:
         footer = ctk.CTkFrame(self, corner_radius=0, height=30)
@@ -487,17 +700,27 @@ class MainWindow(ctk.CTk):
         self._dest_entry.delete(0, "end")
         self._dest_entry.insert(0, settings.default_download_dir)
 
-        if settings.default_mode == DownloadMode.AUDIO:
-            self._mode_selector.set("Audio Only")
-            self._on_mode_changed("Audio Only")
-        else:
-            self._mode_selector.set("Video")
-            self._on_mode_changed("Video")
-
         self._video_quality_menu.set(settings.default_video_quality.value)
         self._video_format_menu.set(settings.default_video_format.value)
         self._audio_format_menu.set(settings.default_audio_format.value)
         self._audio_quality_menu.set(settings.default_audio_quality.value)
+        self._subtitle_format_menu.set(settings.default_subtitle_format.value)
+        self._include_auto_captions_var.set(settings.default_include_auto_captions)
+        self._embed_subs_var.set(settings.default_embed_subtitles)
+        self._keep_sub_files_var.set(settings.default_keep_subtitle_files)
+        if settings.default_embed_subtitles:
+            self._download_subs_var.set(True)
+
+        if settings.default_mode == DownloadMode.AUDIO:
+            self._mode_selector.set("Audio Only")
+            self._on_mode_changed("Audio Only")
+        elif settings.default_mode == DownloadMode.CAPTIONS:
+            self._mode_selector.set("Captions Only")
+            self._on_mode_changed("Captions Only")
+        else:
+            self._mode_selector.set("Video")
+            self._on_mode_changed("Video")
+
         self._queue_service.set_max_concurrent_downloads(settings.max_concurrent_downloads)
 
     def _refresh_dependency_status_ui(self) -> DependencyStatus:
@@ -522,7 +745,7 @@ class MainWindow(ctk.CTk):
         return status
 
     # ------------------------------------------------------------------
-    # Navigation & Mode Handlers
+    # Navigation, Source & Mode Handlers
     # ------------------------------------------------------------------
 
     def _on_navigation_changed(self, selected: str) -> None:
@@ -540,13 +763,139 @@ class MainWindow(ctk.CTk):
             self._settings_view.grid(row=0, column=0, sticky="nsew")
             self._settings_view.load_from_settings(self._settings_service.settings)
 
-    def _on_mode_changed(self, value: str) -> None:
-        if value == "Audio Only":
-            self._video_opts_frame.pack_forget()
-            self._audio_opts_frame.pack(side="left", padx=(0, 14))
+    def _on_source_type_changed(self, value: str) -> None:
+        if value == "Local Media File":
+            self._url_btn_strip.grid_forget()
+            self._url_textbox.grid_forget()
+            self._local_btn_strip.grid(row=0, column=2, sticky="e")
+            self._local_path_entry.grid(row=1, column=0, sticky="ew", padx=12, pady=(2, 8))
+            self._input_prompt_lbl.configure(
+                text="Select a local video or audio file to inspect and trim into a new clip:"
+            )
+            self._pl_frame.pack_forget()
+            if self._mode_selector.get() == "Captions Only":
+                self._mode_selector.set("Video")
+                self._on_mode_changed("Video")
+            self._captions_row.grid_forget()
+            self._trim_timeline.grid(row=2, column=0, sticky="ew", padx=12, pady=(2, 4))
+            self._trim_timeline.set_enabled(True)
+            self._download_now_btn.configure(text="▶ Trim File Now")
+            if self._current_local_media:
+                self._preview_card.show_local_media(self._current_local_media)
+                self._trim_timeline.set_total_duration(self._current_local_media.duration_seconds)
+            else:
+                self._preview_card.clear()
         else:
-            self._audio_opts_frame.pack_forget()
-            self._video_opts_frame.pack(side="left", padx=(0, 14))
+            self._local_btn_strip.grid_forget()
+            self._local_path_entry.grid_forget()
+            self._url_btn_strip.grid(row=0, column=2, sticky="e")
+            self._url_textbox.grid(row=1, column=0, sticky="ew", padx=12, pady=(2, 8))
+            self._input_prompt_lbl.configure(
+                text="Paste one or more YouTube video/playlist URLs (one per line):"
+            )
+            self._pl_frame.pack(side="right")
+            self._on_mode_changed(self._mode_selector.get())
+            if self._current_metadata:
+                self._preview_card.show_metadata(
+                    self._current_metadata,
+                    playlist_mode=self._selected_playlist_mode,
+                    selected_count=len(self._selected_playlist_indices),
+                )
+                self._trim_timeline.set_total_duration(self._current_metadata.duration_seconds)
+            else:
+                self._preview_card.clear()
+
+    def _on_mode_changed(self, value: str) -> None:
+        is_local = self._source_selector.get() == "Local Media File"
+        if is_local and value == "Captions Only":
+            show_warning_dialog(
+                self,
+                "Captions Mode Requires YouTube URL",
+                "Captions Only mode downloads subtitles from YouTube URLs. Switch Input Source to 'YouTube URL' to download captions.",
+            )
+            self._mode_selector.set("Video")
+            value = "Video"
+
+        self._video_opts_frame.pack_forget()
+        self._audio_opts_frame.pack_forget()
+        self._captions_mode_badge.pack_forget()
+
+        if value == "Audio Only":
+            self._audio_opts_frame.pack(side="left", padx=(0, 12))
+            self._captions_row.grid_forget()
+            self._trim_timeline.grid(row=2, column=0, sticky="ew", padx=12, pady=(2, 4))
+            self._download_now_btn.configure(
+                text="▶ Trim Audio Now" if is_local else "▶ Download Audio"
+            )
+        elif value == "Captions Only":
+            self._captions_mode_badge.pack(side="left", padx=(0, 12))
+            self._video_sub_opts_frame.pack_forget()
+            self._captions_row.grid(row=1, column=0, sticky="ew", padx=12, pady=(2, 4))
+            self._trim_timeline.grid_forget()
+            self._download_now_btn.configure(text="▶ Download Captions")
+        else:
+            # Video mode
+            self._video_opts_frame.pack(side="left", padx=(0, 12))
+            if is_local:
+                self._captions_row.grid_forget()
+                self._download_now_btn.configure(text="▶ Trim Video Now")
+            else:
+                self._video_sub_opts_frame.pack(side="left", padx=(0, 8), before=self._caption_track_menu.master.winfo_children()[2] if len(self._caption_track_menu.master.winfo_children()) > 2 else None)
+                self._captions_row.grid(row=1, column=0, sticky="ew", padx=12, pady=(2, 4))
+                self._download_now_btn.configure(text="▶ Download Now")
+            self._trim_timeline.grid(row=2, column=0, sticky="ew", padx=12, pady=(2, 4))
+
+    def _on_embed_subs_toggled(self) -> None:
+        if self._embed_subs_var.get():
+            self._download_subs_var.set(True)
+
+    def _on_caption_track_selected(self, label: str) -> None:
+        code = self._caption_label_to_code.get(label)
+        if not code:
+            return
+        self._subtitle_langs_entry.delete(0, "end")
+        self._subtitle_langs_entry.insert(0, code)
+
+    def _on_auto_captions_filter_changed(self) -> None:
+        if self._current_metadata is not None:
+            self._update_discovered_caption_tracks(self._current_metadata)
+
+    def _update_discovered_caption_tracks(self, meta: MediaMetadata) -> None:
+        include_auto = bool(self._include_auto_captions_var.get())
+        tracks = [
+            t
+            for t in meta.caption_tracks
+            if t.source == CaptionSource.MANUAL or include_auto
+        ]
+        self._caption_label_to_code.clear()
+        if not tracks:
+            self._caption_label_to_code["No matching tracks"] = ""
+            self._caption_track_menu.configure(values=["No matching tracks"])
+            self._caption_track_menu.set("No matching tracks")
+            return
+
+        values: list[str] = []
+        manual_codes = [t.language_code for t in tracks if t.source == CaptionSource.MANUAL]
+        if len(manual_codes) > 1:
+            all_man_lbl = f"All Manual ({len(manual_codes)} langs)"
+            self._caption_label_to_code[all_man_lbl] = ", ".join(manual_codes)
+            values.append(all_man_lbl)
+
+        for t in tracks:
+            src_short = "Manual" if t.source == CaptionSource.MANUAL else "Auto"
+            lbl = f"{t.language_name} ({t.language_code}) [{src_short}]"
+            if lbl not in self._caption_label_to_code:
+                self._caption_label_to_code[lbl] = t.language_code
+                values.append(lbl)
+
+        self._caption_track_menu.configure(values=values)
+        # Prefer English if present, otherwise first track
+        preferred = next((v for v, c in self._caption_label_to_code.items() if c == "en"), values[0])
+        self._caption_track_menu.set(preferred)
+        chosen_code = self._caption_label_to_code.get(preferred, "en")
+        if chosen_code:
+            self._subtitle_langs_entry.delete(0, "end")
+            self._subtitle_langs_entry.insert(0, chosen_code)
 
     def _on_playlist_menu_changed(self, choice: str) -> None:
         mapping = {
@@ -563,7 +912,7 @@ class MainWindow(ctk.CTk):
             self._open_playlist_selector_dialog()
 
     # ------------------------------------------------------------------
-    # URL Input & Background Metadata Fetch
+    # URL & Local File Input + Background Metadata Fetch
     # ------------------------------------------------------------------
 
     def _get_raw_url_input(self) -> str:
@@ -592,7 +941,49 @@ class MainWindow(ctk.CTk):
         self._current_metadata = None
         self._selected_playlist_indices.clear()
         self._preview_card.clear()
+        self._trim_timeline.set_total_duration(0.0)
         self._set_status_message("Cleared URL input.")
+
+    def _browse_local_media_file(self) -> None:
+        exts = " ".join(f"*{ext}" for ext in sorted(SUPPORTED_LOCAL_MEDIA_EXTENSIONS))
+        chosen = filedialog.askopenfilename(
+            parent=self,
+            title="Select Local Video or Audio File to Trim",
+            filetypes=[
+                ("Supported Media Files", exts),
+                ("All Files", "*.*"),
+            ],
+        )
+        if chosen:
+            self._local_path_entry.delete(0, "end")
+            self._local_path_entry.insert(0, chosen)
+            self._inspect_local_media_file()
+
+    def _inspect_local_media_file(self) -> None:
+        raw_path = self._local_path_entry.get().strip()
+        try:
+            valid_path = validate_local_media_path(raw_path)
+            info = self._ffmpeg_service.probe_local_media(valid_path)
+            self._current_local_media = info
+            self._preview_card.show_local_media(info)
+            self._trim_timeline.set_total_duration(info.duration_seconds)
+            self._trim_timeline.set_enabled(True)
+            if info.is_audio_only:
+                self._mode_selector.set("Audio Only")
+                self._on_mode_changed("Audio Only")
+            elif info.has_video:
+                self._mode_selector.set("Video")
+                self._on_mode_changed("Video")
+            self._set_status_message(f"Loaded local file: {valid_path.name}")
+        except AppError as exc:
+            show_error_dialog(self, "Cannot Inspect Local Media", exc.user_message, exc.remedy)
+
+    def _clear_local_input(self) -> None:
+        self._local_path_entry.delete(0, "end")
+        self._current_local_media = None
+        self._preview_card.clear()
+        self._trim_timeline.set_total_duration(0.0)
+        self._set_status_message("Cleared local media input.")
 
     def _start_metadata_fetch(self) -> None:
         raw = self._get_raw_url_input()
@@ -701,7 +1092,87 @@ class MainWindow(ctk.CTk):
     # Adding Jobs to Queue / Starting Downloads
     # ------------------------------------------------------------------
 
+    def _submit_local_trim_job(self, start_immediately: bool) -> None:
+        raw_path = self._local_path_entry.get().strip()
+        try:
+            local_path = validate_local_media_path(raw_path)
+        except AppError as exc:
+            show_error_dialog(self, "Invalid Local Media File", exc.user_message, exc.remedy)
+            return
+
+        dest_raw = self._dest_entry.get().strip()
+        try:
+            dest_dir = validate_output_directory(dest_raw, create_if_missing=True)
+        except AppError as exc:
+            show_error_dialog(self, "Invalid Output Folder", exc.user_message, exc.remedy)
+            return
+
+        dep_status = self._ffmpeg_service.check_dependencies()
+        if not dep_status.ffmpeg_available:
+            show_error_dialog(
+                self,
+                "FFmpeg Required for Local Trimming",
+                "Trimming local video or audio files requires FFmpeg.",
+                FFmpegService.get_missing_ffmpeg_explanation(),
+            )
+            return
+
+        if self._current_local_media is None or self._current_local_media.path != local_path:
+            try:
+                self._current_local_media = self._ffmpeg_service.probe_local_media(local_path)
+                self._preview_card.show_local_media(self._current_local_media)
+                self._trim_timeline.set_total_duration(self._current_local_media.duration_seconds)
+            except AppError as exc:
+                show_error_dialog(self, "Cannot Inspect Local Media", exc.user_message, exc.remedy)
+                return
+
+        max_dur = (
+            float(self._current_local_media.duration_seconds)
+            if self._current_local_media and self._current_local_media.duration_seconds > 0
+            else None
+        )
+        try:
+            start_s, end_s = validate_trim_range(
+                self._trim_timeline.get_start_text(),
+                self._trim_timeline.get_end_text(),
+                media_duration=max_dur,
+            )
+            self._trim_timeline.set_range_seconds(start_s, end_s)
+        except AppError as exc:
+            show_error_dialog(self, "Invalid Trim Range", exc.user_message, exc.remedy)
+            return
+
+        mode = (
+            DownloadMode.AUDIO
+            if self._mode_selector.get() == "Audio Only"
+            else DownloadMode.VIDEO
+        )
+        settings = self._settings_service.settings
+        try:
+            self._queue_service.add_local_trim_job(
+                local_source_path=local_path,
+                destination_dir=dest_dir,
+                mode=mode,
+                trim_start_seconds=start_s,
+                trim_end_seconds=end_s,
+                trim_accurate=self._trim_timeline.is_accurate_trim(),
+                video_format=VideoFormat(self._video_format_menu.get()),
+                audio_format=AudioFormat(self._audio_format_menu.get()),
+                audio_quality=AudioQuality(self._audio_quality_menu.get()),
+                overwrite_behavior=settings.overwrite_behavior,
+                start_immediately=start_immediately,
+            )
+            self._queue_view.refresh_all()
+            action_word = "Started trimming" if start_immediately else "Added local trim job to queue"
+            self._set_status_message(f"{action_word}: {local_path.name}")
+        except AppError as exc:
+            show_error_dialog(self, "Could Not Add Local Trim Job", exc.user_message, exc.remedy)
+
     def _submit_urls(self, start_immediately: bool) -> None:
+        if self._source_selector.get() == "Local Media File":
+            self._submit_local_trim_job(start_immediately=start_immediately)
+            return
+
         raw_text = self._get_raw_url_input()
         parsed = parse_batch_urls(raw_text)
 
@@ -747,34 +1218,122 @@ class MainWindow(ctk.CTk):
             show_error_dialog(self, "Invalid Download Folder", exc.user_message, exc.remedy)
             return
 
-        mode = (
-            DownloadMode.AUDIO
-            if self._mode_selector.get() == "Audio Only"
-            else DownloadMode.VIDEO
-        )
+        mode_str = self._mode_selector.get()
+        if mode_str == "Audio Only":
+            mode = DownloadMode.AUDIO
+        elif mode_str == "Captions Only":
+            mode = DownloadMode.CAPTIONS
+        else:
+            mode = DownloadMode.VIDEO
+
         video_quality = VideoQuality(self._video_quality_menu.get())
         video_format = VideoFormat(self._video_format_menu.get())
         audio_format = AudioFormat(self._audio_format_menu.get())
         audio_quality = AudioQuality(self._audio_quality_menu.get())
+        subtitle_format = SubtitleFormat(self._subtitle_format_menu.get())
+        include_auto_captions = bool(self._include_auto_captions_var.get())
+        txt_include_timestamps = bool(self._txt_timestamps_var.get())
 
-        dep_status = self._ffmpeg_service.check_dependencies()
-        if mode == DownloadMode.AUDIO and audio_format.requires_ffmpeg_conversion and not dep_status.ffmpeg_available:
-            show_error_dialog(
-                self,
-                "FFmpeg Required for Audio Conversion",
-                f"Converting audio to {audio_format.value.upper()} requires FFmpeg, which is not currently installed.",
-                FFmpegService.get_missing_ffmpeg_explanation(),
+        # Subtitle flags
+        download_subtitles = (
+            True
+            if mode == DownloadMode.CAPTIONS
+            else (
+                bool(self._download_subs_var.get()) or bool(self._embed_subs_var.get())
+                if mode == DownloadMode.VIDEO
+                else False
             )
-            return
+        )
+        embed_subtitles = (
+            bool(self._embed_subs_var.get()) if mode == DownloadMode.VIDEO else False
+        )
+        keep_subtitle_files = (
+            True
+            if mode == DownloadMode.CAPTIONS
+            else bool(self._keep_sub_files_var.get())
+        )
 
-        if (
-            mode == DownloadMode.VIDEO
-            and not dep_status.ffmpeg_available
-            and video_quality in {VideoQuality.Q2160P, VideoQuality.Q1440P, VideoQuality.Q1080P}
-        ):
-            self._set_status_message(
-                "Note: FFmpeg is not installed; falling back to highest available pre-merged progressive stream."
-            )
+        subtitle_languages: list[str] = ["en"]
+        if mode == DownloadMode.CAPTIONS or download_subtitles or embed_subtitles:
+            try:
+                subtitle_languages = validate_subtitle_languages(
+                    self._subtitle_langs_entry.get()
+                )
+            except AppError as exc:
+                show_error_dialog(
+                    self,
+                    "Invalid Subtitle Language Selection",
+                    exc.user_message,
+                    exc.remedy,
+                )
+                return
+
+        # Trim flags (only for Video / Audio Only modes)
+        trim_enabled = False
+        trim_start_s = 0.0
+        trim_end_s = 0.0
+        trim_accurate = False
+        if mode in {DownloadMode.VIDEO, DownloadMode.AUDIO} and self._trim_timeline.is_enabled():
+            max_dur_url: float | None = None
+            if (
+                len(parsed.valid_urls) == 1
+                and self._current_metadata
+                and self._current_metadata.url == parsed.valid_urls[0]
+                and self._current_metadata.duration_seconds > 0
+            ):
+                max_dur_url = float(self._current_metadata.duration_seconds)
+            try:
+                trim_start_s, trim_end_s = validate_trim_range(
+                    self._trim_timeline.get_start_text(),
+                    self._trim_timeline.get_end_text(),
+                    media_duration=max_dur_url,
+                )
+                self._trim_timeline.set_range_seconds(trim_start_s, trim_end_s)
+                trim_enabled = True
+                trim_accurate = self._trim_timeline.is_accurate_trim()
+            except AppError as exc:
+                show_error_dialog(self, "Invalid Trim Range", exc.user_message, exc.remedy)
+                return
+
+        # Dependency checks (Captions Only mode NEVER requires FFmpeg!)
+        if mode != DownloadMode.CAPTIONS:
+            dep_status = self._ffmpeg_service.check_dependencies()
+            if trim_enabled and not dep_status.ffmpeg_available:
+                show_error_dialog(
+                    self,
+                    "FFmpeg Required for Trimming",
+                    "Downloading or trimming a specific time range requires FFmpeg.",
+                    FFmpegService.get_missing_ffmpeg_explanation(),
+                )
+                return
+            if embed_subtitles and not dep_status.ffmpeg_available:
+                show_error_dialog(
+                    self,
+                    "FFmpeg Required for Subtitle Embedding",
+                    "Embedding soft subtitles into a video container requires FFmpeg.",
+                    FFmpegService.get_missing_ffmpeg_explanation(),
+                )
+                return
+            if (
+                mode == DownloadMode.AUDIO
+                and audio_format.requires_ffmpeg_conversion
+                and not dep_status.ffmpeg_available
+            ):
+                show_error_dialog(
+                    self,
+                    "FFmpeg Required for Audio Conversion",
+                    f"Converting audio to {audio_format.value.upper()} requires FFmpeg, which is not currently installed.",
+                    FFmpegService.get_missing_ffmpeg_explanation(),
+                )
+                return
+            if (
+                mode == DownloadMode.VIDEO
+                and not dep_status.ffmpeg_available
+                and video_quality in {VideoQuality.Q2160P, VideoQuality.Q1440P, VideoQuality.Q1080P}
+            ):
+                self._set_status_message(
+                    "Note: FFmpeg is not installed; falling back to highest available pre-merged progressive stream."
+                )
 
         settings = self._settings_service.settings
         added_count = 0
@@ -787,9 +1346,6 @@ class MainWindow(ctk.CTk):
 
             if self._current_metadata and self._current_metadata.url == url:
                 title_hint = self._current_metadata.title
-            elif is_likely_playlist_url(url) and pl_mode == PlaylistMode.SINGLE:
-                # Respect current playlist selector choice
-                pass
 
             try:
                 self._queue_service.add_job(
@@ -805,6 +1361,17 @@ class MainWindow(ctk.CTk):
                     overwrite_behavior=settings.overwrite_behavior,
                     playlist_mode=pl_mode,
                     selected_playlist_indices=pl_indices,
+                    trim_enabled=trim_enabled,
+                    trim_start_seconds=trim_start_s,
+                    trim_end_seconds=trim_end_s,
+                    trim_accurate=trim_accurate,
+                    download_subtitles=download_subtitles,
+                    include_auto_captions=include_auto_captions,
+                    subtitle_languages=subtitle_languages,
+                    subtitle_format=subtitle_format,
+                    txt_include_timestamps=txt_include_timestamps,
+                    embed_subtitles=embed_subtitles,
+                    keep_subtitle_files=keep_subtitle_files,
                     allow_duplicate=False,
                     start_immediately=start_immediately,
                 )
@@ -815,7 +1382,7 @@ class MainWindow(ctk.CTk):
         self._queue_view.refresh_all()
 
         if duplicate_queue_errors and added_count == 0:
-            show_warning_dialog(self, "Already in Queue", duplicate_queue_errors[0])
+            show_warning_dialog(self, "Cannot Add to Queue", duplicate_queue_errors[0])
             return
 
         action_word = "Started downloading" if start_immediately else "Added to queue"
@@ -957,6 +1524,8 @@ class MainWindow(ctk.CTk):
                 playlist_mode=self._selected_playlist_mode,
                 selected_count=len(self._selected_playlist_indices),
             )
+            self._trim_timeline.set_total_duration(meta.duration_seconds)
+            self._update_discovered_caption_tracks(meta)
             self._set_status_message(f"Loaded metadata: {meta.title}")
 
         elif et == EventType.METADATA_FAILED:

@@ -350,3 +350,283 @@ def validate_playlist_indices(indices: list[int] | None) -> list[int]:
 
     return sorted(cleaned)
 
+
+SUPPORTED_LOCAL_VIDEO_EXTENSIONS = frozenset(
+    {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".flv", ".wmv", ".ts"}
+)
+SUPPORTED_LOCAL_AUDIO_EXTENSIONS = frozenset(
+    {".mp3", ".m4a", ".wav", ".opus", ".flac", ".ogg", ".aac", ".wma"}
+)
+SUPPORTED_LOCAL_MEDIA_EXTENSIONS = (
+    SUPPORTED_LOCAL_VIDEO_EXTENSIONS | SUPPORTED_LOCAL_AUDIO_EXTENSIONS
+)
+
+_LANG_CODE_RE = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{1,8})*$")
+
+
+def parse_timestamp(raw_value: str | float | int) -> float:
+    """Parse a timestamp in SS, MM:SS, or HH:MM:SS (with optional fractional seconds) into seconds.
+
+    Raises ValidationError if the timestamp is empty, negative, malformed, or out of range.
+    """
+    if isinstance(raw_value, bool) or raw_value is None:
+        raise ValidationError(
+            "Timestamp cannot be empty.",
+            remedy="Enter a time in SS, MM:SS, or HH:MM:SS format (e.g., '01:30' or '00:05:15').",
+        )
+
+    if isinstance(raw_value, (int, float)):
+        import math
+
+        val = float(raw_value)
+        if not math.isfinite(val):
+            raise ValidationError(
+                "Timestamp must be a finite number.",
+                remedy="Enter a valid non-negative timestamp.",
+            )
+        if val < 0:
+            raise ValidationError(
+                "Timestamp cannot be negative.",
+                remedy="Enter a timestamp of 00:00 or greater.",
+            )
+        return round(val, 3)
+
+    text = str(raw_value).strip()
+    if not text:
+        raise ValidationError(
+            "Timestamp cannot be empty.",
+            remedy="Enter a time in SS, MM:SS, or HH:MM:SS format (e.g., '01:30' or '00:05:15').",
+        )
+
+    if text.startswith("-"):
+        raise ValidationError(
+            f"Timestamp '{text}' cannot be negative.",
+            remedy="Enter a timestamp of 00:00 or greater.",
+        )
+
+    # Support comma decimal separator if pasted from SRT (e.g. 00:01:02,500)
+    normalized = text.replace(",", ".")
+    parts = normalized.split(":")
+    if len(parts) > 3:
+        raise ValidationError(
+            f"Invalid timestamp format '{text}'. Too many colon-separated fields.",
+            remedy="Use SS, MM:SS, or HH:MM:SS format (e.g., '45', '02:30', or '01:02:30.5').",
+        )
+
+    try:
+        if len(parts) == 1:
+            seconds = float(parts[0])
+            if seconds < 0:
+                raise ValueError("negative")
+            return round(seconds, 3)
+
+        if len(parts) == 2:
+            if "." in parts[0]:
+                raise ValueError("fractional minutes not allowed when colon is used")
+            minutes = int(parts[0])
+            seconds = float(parts[1])
+            if minutes < 0 or seconds < 0 or seconds >= 60.0:
+                raise ValidationError(
+                    f"Invalid MM:SS timestamp '{text}' (seconds must be between 0 and 59.999).",
+                    remedy="Use MM:SS where SS is less than 60 (e.g., '02:45').",
+                )
+            return round(minutes * 60.0 + seconds, 3)
+
+        # len(parts) == 3 -> HH:MM:SS
+        if "." in parts[0] or "." in parts[1]:
+            raise ValueError("fractional hours or minutes not allowed")
+        hours = int(parts[0])
+        minutes = int(parts[1])
+        seconds = float(parts[2])
+        if hours < 0 or minutes < 0 or minutes >= 60 or seconds < 0 or seconds >= 60.0:
+            raise ValidationError(
+                f"Invalid HH:MM:SS timestamp '{text}' (minutes and seconds must be < 60).",
+                remedy="Use HH:MM:SS where MM and SS are 00..59 (e.g., '01:15:30').",
+            )
+        return round(hours * 3600.0 + minutes * 60.0 + seconds, 3)
+
+    except ValidationError:
+        raise
+    except (ValueError, TypeError) as exc:
+        raise ValidationError(
+            f"Malformed timestamp '{text}'.",
+            remedy="Enter a valid timestamp in SS, MM:SS, or HH:MM:SS format (e.g., '00:30' or '01:05:00').",
+        ) from exc
+
+
+def format_timestamp(
+    seconds: float,
+    include_millis: bool = False,
+    force_hours: bool = False,
+    srt_comma: bool = False,
+) -> str:
+    """Format a non-negative timestamp in seconds into MM:SS or HH:MM:SS(.mmm)."""
+    clamped = max(0.0, float(seconds))
+    if include_millis:
+        total_ms = int(round(clamped * 1000))
+        total_sec, ms = divmod(total_ms, 1000)
+        hours, rem = divmod(total_sec, 3600)
+        minutes, secs = divmod(rem, 60)
+        sep = "," if srt_comma else "."
+        if force_hours or hours > 0:
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}{sep}{ms:03d}"
+        return f"{minutes:02d}:{secs:02d}{sep}{ms:03d}"
+
+    total_sec = int(round(clamped))
+    hours, rem = divmod(total_sec, 3600)
+    minutes, secs = divmod(rem, 60)
+    if force_hours or hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def validate_trim_range(
+    start_raw: str | float | int,
+    end_raw: str | float | int,
+    media_duration: float | None = None,
+    min_clip_seconds: float = 0.5,
+    max_duration_seconds: float | None = None,
+) -> tuple[float, float]:
+    """Parse and validate a trim start and end timestamp pair.
+
+    Returns (start_seconds, end_seconds).
+    Raises ValidationError if start >= end, clip is shorter than min_clip_seconds,
+    or range exceeds known media_duration.
+    """
+    if media_duration is None and max_duration_seconds is not None:
+        media_duration = max_duration_seconds
+    start_sec = parse_timestamp(start_raw)
+    end_sec = parse_timestamp(end_raw)
+
+    if end_sec <= start_sec:
+        raise ValidationError(
+            f"Trim End Time ({format_timestamp(end_sec)}) must be greater than Start Time ({format_timestamp(start_sec)}).",
+            remedy="Set the End Time after the Start Time.",
+        )
+
+    if (end_sec - start_sec) < min_clip_seconds:
+        raise ValidationError(
+            f"Selected trim segment ({end_sec - start_sec:.2f}s) is shorter than the minimum clip length ({min_clip_seconds:.1f}s).",
+            remedy=f"Select a segment of at least {min_clip_seconds:.1f} seconds.",
+        )
+
+    if media_duration is not None and media_duration > 0:
+        if start_sec >= media_duration:
+            raise ValidationError(
+                f"Trim Start Time ({format_timestamp(start_sec)}) exceeds the media duration ({format_timestamp(media_duration)}).",
+                remedy=f"Choose a Start Time before {format_timestamp(media_duration)}.",
+            )
+        # Allow a tiny 50ms rounding tolerance at the end of a file, clamping to media_duration
+        if end_sec > media_duration + 0.05:
+            raise ValidationError(
+                f"Trim End Time ({format_timestamp(end_sec)}) exceeds the media duration ({format_timestamp(media_duration)}).",
+                remedy=f"Choose an End Time less than or equal to {format_timestamp(media_duration)}.",
+            )
+        if end_sec > media_duration:
+            end_sec = round(float(media_duration), 3)
+
+    return start_sec, end_sec
+
+
+def validate_local_media_path(path_value: str | Path) -> Path:
+    """Validate that a local media file path exists, is readable, and has a supported extension."""
+    if path_value is None:
+        raise ValidationError(
+            "Local media file path cannot be empty.",
+            remedy="Browse and select a local video or audio file.",
+        )
+    raw = str(path_value).strip()
+    if not raw or "\x00" in raw:
+        raise ValidationError(
+            "Please select a valid local media file.",
+            remedy="Click 'Browse File...' to choose an existing video or audio file.",
+        )
+
+    try:
+        resolved = Path(raw).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValidationError(
+            f"Invalid local file path '{raw}': {exc}",
+            remedy="Choose a valid file path on your local disk.",
+        ) from exc
+
+    if not resolved.exists():
+        raise ValidationError(
+            f"Local media file does not exist: '{resolved}'",
+            remedy="Verify the file path exists and has not been moved or deleted.",
+        )
+
+    if not resolved.is_file():
+        raise ValidationError(
+            f"Selected path is a folder, not a media file: '{resolved}'",
+            remedy="Select a video or audio file rather than a directory.",
+        )
+
+    ext = resolved.suffix.lower()
+    if ext not in SUPPORTED_LOCAL_MEDIA_EXTENSIONS:
+        supported_list = ", ".join(sorted(SUPPORTED_LOCAL_MEDIA_EXTENSIONS))
+        raise ValidationError(
+            f"Unsupported media file extension '{ext or '(none)'}'.",
+            remedy=f"Select a supported video or audio file ({supported_list}).",
+        )
+
+    try:
+        size = resolved.stat().st_size
+    except OSError as exc:
+        raise ValidationError(
+            f"Cannot access local media file '{resolved.name}': {exc}",
+            remedy="Check file permissions and ensure the file is not locked.",
+        ) from exc
+
+    if size <= 0:
+        raise ValidationError(
+            f"The selected media file '{resolved.name}' is empty (0 bytes).",
+            remedy="Choose a valid, non-empty video or audio file.",
+        )
+
+    return resolved
+
+
+def validate_subtitle_languages(raw_languages: list[str] | str | None) -> list[str]:
+    """Validate and normalize one or more subtitle language codes (e.g., ['en', 'es', 'zh-Hans'])."""
+    if raw_languages is None:
+        raise ValidationError(
+            "At least one caption language must be selected.",
+            remedy="Select a language (such as 'en') or enter comma-separated language codes.",
+        )
+
+    if isinstance(raw_languages, str):
+        tokens = [t.strip() for t in raw_languages.replace(";", ",").split(",") if t.strip()]
+    else:
+        tokens = []
+        for item in raw_languages:
+            if isinstance(item, str):
+                for sub in item.replace(";", ",").split(","):
+                    if sub.strip():
+                        tokens.append(sub.strip())
+
+    if not tokens:
+        raise ValidationError(
+            "At least one caption language must be selected.",
+            remedy="Select or enter at least one language code (for example, 'en').",
+        )
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for token in tokens:
+        if token.lower() == "all":
+            if "all" not in seen:
+                seen.add("all")
+                normalized.append("all")
+            continue
+        if not _LANG_CODE_RE.match(token):
+            raise ValidationError(
+                f"Invalid subtitle language code '{token}'.",
+                remedy="Use standard language codes such as 'en', 'en-US', 'es', 'fr', 'de', 'ja', or 'zh-Hans'.",
+            )
+        key = token.lower()
+        if key not in seen:
+            seen.add(key)
+            normalized.append(token)
+
+    return normalized
